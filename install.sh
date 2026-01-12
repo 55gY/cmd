@@ -125,7 +125,43 @@ check_status() {
     echo -e "${BLUE}=====================================================${NC}"
 }
 
-# --- 3. 重启 SSH 服务 (兼容多系统) ---
+# --- 3. SSH 配置辅助函数 ---
+# 修改SSH配置项（支持模块化配置目录）
+set_ssh_config() {
+    local key="$1"
+    local value="$2"
+    local pattern="^#\\?${key}"
+    
+    # 检查是否存在 sshd_config.d 目录
+    local config_dir="/etc/ssh/sshd_config.d"
+    local cloud_config=""
+    
+    # 查找云平台配置文件
+    if [ -d "$config_dir" ]; then
+        # AWS, Google Cloud 等常见配置文件
+        for conf_file in "60-cloudimg-settings.conf" "50-cloud-init.conf" "99-cloudimg-settings.conf"; do
+            if [ -f "$config_dir/$conf_file" ]; then
+                cloud_config="$config_dir/$conf_file"
+                echo -e "${BLUE}  检测到云平台配置: $conf_file${NC}"
+                # 修改云平台配置文件
+                if grep -q "$pattern" "$cloud_config"; then
+                    sed -i "s/$pattern.*/${key} ${value}/" "$cloud_config"
+                    echo -e "${GREEN}  ✓ 已更新 $conf_file 中的 $key${NC}"
+                fi
+            fi
+        done
+    fi
+    
+    # 同时修改主配置文件
+    if grep -q "$pattern" "$SSH_CONF"; then
+        sed -i "s/$pattern.*/${key} ${value}/" "$SSH_CONF"
+    else
+        echo "${key} ${value}" >> "$SSH_CONF"
+    fi
+    echo -e "${GREEN}  ✓ 已更新主配置文件中的 $key${NC}"
+}
+
+# 重启 SSH 服务 (兼容多系统)
 restart_service() {
     echo -e "${BLUE}正在校验配置并重启 $SERVICE_NAME 服务...${NC}"
     sshd -t
@@ -143,52 +179,118 @@ enable_key_login() {
     echo -e "\n${YELLOW}[操作] 正在配置 Root 密钥登录...${NC}"
     mkdir -p /root/.ssh && chmod 700 /root/.ssh
 
-    # 检查并清理云平台的 root 登录限制
-    if [ -f "$AUTH_KEYS" ]; then
-        echo -e "${BLUE}检查现有密钥文件...${NC}"
-        if grep -q 'Please login as the user.*rather than.*root' "$AUTH_KEYS"; then
-            echo -e "${YELLOW}检测到云平台的 root 登录限制，正在清理...${NC}"
-            # 备份原文件
-            cp "$AUTH_KEYS" "${AUTH_KEYS}.bak.$(date +%Y%m%d%H%M%S)"
-            # 移除包含限制命令的行，保留纯粹的公钥
-            sed -i '/Please login as the user.*rather than.*root/d' "$AUTH_KEYS"
-            # 移除 command= 强制命令前缀（保留公钥部分）
-            sed -i 's/^command="[^"]*"[[:space:]]*//g' "$AUTH_KEYS"
-            # 移除其他可能的限制选项
-            sed -i 's/^no-port-forwarding,no-agent-forwarding,no-X11-forwarding,//g' "$AUTH_KEYS"
-            echo -e "${GREEN}已清理云平台限制，原文件已备份到 ${AUTH_KEYS}.bak.*${NC}"
-        fi
-    fi
-
+    # 判断是否需要生成新密钥
+    local need_new_key=false
     if [ ! -f "$AUTH_KEYS" ]; then
-        echo -e "生成 4096 位 RSA 密钥对..."
-        ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -N ""
-        cat /root/.ssh/id_rsa.pub >> "$AUTH_KEYS"
-        chmod 600 "$AUTH_KEYS"
-        echo -e "${GREEN}密钥对已生成！请立即下载私钥: /root/.ssh/id_rsa${NC}"
+        need_new_key=true
+        echo -e "${YELLOW}密钥文件不存在，将生成新密钥对...${NC}"
     else
-        echo -e "${BLUE}密钥文件已存在，可选操作:${NC}"
+        echo -e "${BLUE}密钥文件已存在 (包含 $(wc -l < $AUTH_KEYS 2>/dev/null || echo "0") 个密钥)${NC}"
         read -p "是否添加新的密钥对？(y/n): " add_key
-        if [[ "$add_key" =~ ^[Yy]$ ]]; then
-            echo -e "生成 4096 位 RSA 密钥对..."
-            ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa_new -N ""
-            cat /root/.ssh/id_rsa_new.pub >> "$AUTH_KEYS"
+        [[ "$add_key" =~ ^[Yy]$ ]] && need_new_key=true
+    fi
+
+    if [ "$need_new_key" = true ]; then
+        echo -e "${BLUE}生成 4096 位 RSA 密钥对...${NC}"
+        local key_name="/root/.ssh/id_rsa"
+        
+        # 如果已存在，使用新文件名
+        if [ -f "$key_name" ]; then
+            key_name="/root/.ssh/id_rsa_$(date +%Y%m%d%H%M%S)"
+            echo -e "${YELLOW}检测到已存在密钥，使用新文件名: $(basename $key_name)${NC}"
+        fi
+        
+        ssh-keygen -t rsa -b 4096 -f "$key_name" -N "" -C "root@$(hostname)"
+        
+        if [ $? -eq 0 ]; then
+            cat "${key_name}.pub" >> "$AUTH_KEYS"
             chmod 600 "$AUTH_KEYS"
-            echo -e "${GREEN}新密钥对已生成！请立即下载私钥: /root/.ssh/id_rsa_new${NC}"
+            echo -e "${GREEN}✓ 密钥对已生成${NC}"
+            echo -e "${GREEN}✓ 公钥已添加到 authorized_keys${NC}"
+            echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            echo -e "${RED}重要: 请立即下载私钥文件！${NC}"
+            echo -e "${RED}私钥路径: $key_name${NC}"
+            echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        else
+            echo -e "${RED}密钥生成失败！${NC}"
+            return 1
         fi
     fi
 
-    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin without-password/' $SSH_CONF
-    sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' $SSH_CONF
-    sed -i 's/^#\?AuthorizedKeysFile.*/AuthorizedKeysFile .ssh\/authorized_keys/' $SSH_CONF
+    # 配置 SSH
+    echo -e "${BLUE}配置 SSH 服务...${NC}"
+    set_ssh_config "PermitRootLogin" "yes"
+    set_ssh_config "PubkeyAuthentication" "yes"
+    set_ssh_config "AuthorizedKeysFile" ".ssh/authorized_keys"
     
-    read -p "是否禁用密码登录？(y/n): " dis_pwd
-    [[ "$dis_pwd" =~ ^[Yy]$ ]] && sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' $SSH_CONF
+    # 检查当前密码登录状态
+    local current_pwd_auth=""
+    local config_dir="/etc/ssh/sshd_config.d"
+    
+    # 首先检查云平台配置文件
+    if [ -d "$config_dir" ]; then
+        for conf_file in "60-cloudimg-settings.conf" "50-cloud-init.conf" "99-cloudimg-settings.conf"; do
+            if [ -f "$config_dir/$conf_file" ]; then
+                local cloud_pwd=$(grep "^PasswordAuthentication" "$config_dir/$conf_file" 2>/dev/null | awk '{print $2}')
+                if [ -n "$cloud_pwd" ]; then
+                    current_pwd_auth="$cloud_pwd"
+                    break
+                fi
+            fi
+        done
+    fi
+    
+    # 如果云平台配置中没有，检查主配置文件
+    if [ -z "$current_pwd_auth" ]; then
+        current_pwd_auth=$(grep "^PasswordAuthentication" "$SSH_CONF" 2>/dev/null | awk '{print $2}')
+    fi
+    
+    # 如果还是没找到，默认为yes
+    [ -z "$current_pwd_auth" ] && current_pwd_auth="yes"
+    
+    # 询问是否禁用密码登录
+    echo -e "\n${BLUE}当前密码登录状态: ${YELLOW}$current_pwd_auth${NC}"
+    
+    if [[ "$current_pwd_auth" == "no" ]]; then
+        echo -e "${YELLOW}密码登录已禁用${NC}"
+        read -p "是否启用密码登录？(y/n): " enable_pwd
+        if [[ "$enable_pwd" =~ ^[Yy]$ ]]; then
+            set_ssh_config "PasswordAuthentication" "yes"
+            echo -e "${GREEN}已启用密码登录${NC}"
+        else
+            echo -e "${YELLOW}保持禁用状态${NC}"
+        fi
+    else
+        echo -e "${YELLOW}是否禁用密码登录？${NC}"
+        echo -e "${RED}警告: 禁用后只能使用密钥登录，请确保已下载私钥！${NC}"
+        read -p "禁用密码登录？(y/n): " dis_pwd
+        
+        if [[ "$dis_pwd" =~ ^[Yy]$ ]]; then
+            set_ssh_config "PasswordAuthentication" "no"
+            echo -e "${YELLOW}已禁用密码登录${NC}"
+        else
+            set_ssh_config "PasswordAuthentication" "yes"
+            echo -e "${GREEN}已保留密码登录${NC}"
+        fi
+    fi
+    
+    # 显示当前 authorized_keys 内容（仅显示前几个字符）
+    echo -e "\n${BLUE}当前 authorized_keys 内容:${NC}"
+    if [ -f "$AUTH_KEYS" ]; then
+        awk '{print NR". " substr($1,1,20)"... " substr($2,1,30)"... " $3}' "$AUTH_KEYS"
+    fi
     
     restart_service
     
-    echo -e "\n${GREEN}===== 配置完成 =====${NC}"
-    echo -e "${YELLOW}提示: 请确保已下载私钥文件后再断开当前会话！${NC}"
+    echo -e "\n${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}        Root 密钥登录配置完成！       ${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}下一步操作:${NC}"
+    echo -e "  1. 下载私钥文件到本地"
+    echo -e "  2. 设置私钥权限: ${GREEN}chmod 600 私钥文件${NC}"
+    echo -e "  3. 使用私钥登录: ${GREEN}ssh -i 私钥文件 root@服务器IP${NC}"
+    echo -e "${RED}  4. 确认密钥登录成功后，再断开当前会话！${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
 }
 
 # --- 5. 功能：修改端口 (含防火墙/SELinux 联动) ---
