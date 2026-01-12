@@ -179,6 +179,35 @@ enable_key_login() {
     echo -e "\n${YELLOW}[操作] 正在配置 Root 密钥登录...${NC}"
     mkdir -p /root/.ssh && chmod 700 /root/.ssh
 
+    # 检查是否存在云平台的root登录限制
+    if [ -f "$AUTH_KEYS" ] && grep -q 'command=".*Please login as the user.*rather than.*root' "$AUTH_KEYS"; then
+        echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${RED}检测到云平台的 root 登录限制！${NC}"
+        echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${YELLOW}当前 authorized_keys 包含阻止 root 登录的命令${NC}"
+        echo -e "${BLUE}示例: command=\"echo 'Please login...'\"${NC}"
+        echo ""
+        read -p "是否清理此限制以允许 root 登录？(y/n): " clean_restriction
+        
+        if [[ "$clean_restriction" =~ ^[Yy]$ ]]; then
+            echo -e "${BLUE}正在清理云平台限制...${NC}"
+            
+            # 备份原文件
+            local backup_file="${AUTH_KEYS}.bak.$(date +%Y%m%d%H%M%S)"
+            cp "$AUTH_KEYS" "$backup_file"
+            echo -e "${GREEN}✓ 已备份到: $backup_file${NC}"
+            
+            # 使用sed清理：移除所有选项前缀，只保留密钥类型开始的部分
+            sed -i 's/^.*\(ssh-rsa\|ssh-ed25519\|ecdsa-sha2-nistp[0-9]\+\|ssh-dss\)/\1/' "$AUTH_KEYS"
+            
+            echo -e "${GREEN}✓ 已清理云平台限制${NC}"
+            echo -e "${YELLOW}提示: 如需恢复，备份文件: $backup_file${NC}"
+        else
+            echo -e "${YELLOW}跳过清理，保留原有限制${NC}"
+            echo -e "${RED}注意: 保留限制可能导致无法使用 root 登录！${NC}"
+        fi
+    fi
+
     # 判断是否需要生成新密钥
     local need_new_key=false
     if [ ! -f "$AUTH_KEYS" ]; then
@@ -252,25 +281,17 @@ enable_key_login() {
     echo -e "\n${BLUE}当前密码登录状态: ${YELLOW}$current_pwd_auth${NC}"
     
     if [[ "$current_pwd_auth" == "no" ]]; then
-        echo -e "${YELLOW}密码登录已禁用${NC}"
-        read -p "是否启用密码登录？(y/n): " enable_pwd
-        if [[ "$enable_pwd" =~ ^[Yy]$ ]]; then
-            set_ssh_config "PasswordAuthentication" "yes"
-            echo -e "${GREEN}已启用密码登录${NC}"
-        else
-            echo -e "${YELLOW}保持禁用状态${NC}"
-        fi
+        echo -e "${GREEN}密码登录已禁用，安全性较高${NC}"
     else
-        echo -e "${YELLOW}是否禁用密码登录？${NC}"
+        echo -e "${YELLOW}建议禁用密码登录以提高安全性${NC}"
         echo -e "${RED}警告: 禁用后只能使用密钥登录，请确保已下载私钥！${NC}"
-        read -p "禁用密码登录？(y/n): " dis_pwd
+        read -p "是否禁用密码登录？(y/n): " dis_pwd
         
         if [[ "$dis_pwd" =~ ^[Yy]$ ]]; then
             set_ssh_config "PasswordAuthentication" "no"
-            echo -e "${YELLOW}已禁用密码登录${NC}"
+            echo -e "${GREEN}已禁用密码登录${NC}"
         else
-            set_ssh_config "PasswordAuthentication" "yes"
-            echo -e "${GREEN}已保留密码登录${NC}"
+            echo -e "${YELLOW}已保留密码登录${NC}"
         fi
     fi
     
