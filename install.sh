@@ -143,12 +143,39 @@ enable_key_login() {
     echo -e "\n${YELLOW}[操作] 正在配置 Root 密钥登录...${NC}"
     mkdir -p /root/.ssh && chmod 700 /root/.ssh
 
+    # 检查并清理云平台的 root 登录限制
+    if [ -f "$AUTH_KEYS" ]; then
+        echo -e "${BLUE}检查现有密钥文件...${NC}"
+        if grep -q 'Please login as the user.*rather than.*root' "$AUTH_KEYS"; then
+            echo -e "${YELLOW}检测到云平台的 root 登录限制，正在清理...${NC}"
+            # 备份原文件
+            cp "$AUTH_KEYS" "${AUTH_KEYS}.bak.$(date +%Y%m%d%H%M%S)"
+            # 移除包含限制命令的行，保留纯粹的公钥
+            sed -i '/Please login as the user.*rather than.*root/d' "$AUTH_KEYS"
+            # 移除 command= 强制命令前缀（保留公钥部分）
+            sed -i 's/^command="[^"]*"[[:space:]]*//g' "$AUTH_KEYS"
+            # 移除其他可能的限制选项
+            sed -i 's/^no-port-forwarding,no-agent-forwarding,no-X11-forwarding,//g' "$AUTH_KEYS"
+            echo -e "${GREEN}已清理云平台限制，原文件已备份到 ${AUTH_KEYS}.bak.*${NC}"
+        fi
+    fi
+
     if [ ! -f "$AUTH_KEYS" ]; then
         echo -e "生成 4096 位 RSA 密钥对..."
         ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -N ""
         cat /root/.ssh/id_rsa.pub >> "$AUTH_KEYS"
         chmod 600 "$AUTH_KEYS"
         echo -e "${GREEN}密钥对已生成！请立即下载私钥: /root/.ssh/id_rsa${NC}"
+    else
+        echo -e "${BLUE}密钥文件已存在，可选操作:${NC}"
+        read -p "是否添加新的密钥对？(y/n): " add_key
+        if [[ "$add_key" =~ ^[Yy]$ ]]; then
+            echo -e "生成 4096 位 RSA 密钥对..."
+            ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa_new -N ""
+            cat /root/.ssh/id_rsa_new.pub >> "$AUTH_KEYS"
+            chmod 600 "$AUTH_KEYS"
+            echo -e "${GREEN}新密钥对已生成！请立即下载私钥: /root/.ssh/id_rsa_new${NC}"
+        fi
     fi
 
     sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin without-password/' $SSH_CONF
@@ -159,6 +186,9 @@ enable_key_login() {
     [[ "$dis_pwd" =~ ^[Yy]$ ]] && sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' $SSH_CONF
     
     restart_service
+    
+    echo -e "\n${GREEN}===== 配置完成 =====${NC}"
+    echo -e "${YELLOW}提示: 请确保已下载私钥文件后再断开当前会话！${NC}"
 }
 
 # --- 5. 功能：修改端口 (含防火墙/SELinux 联动) ---
