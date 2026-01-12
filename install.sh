@@ -89,6 +89,7 @@ check_status() {
     echo -e "系统架构     : ${YELLOW}$OS_ARCH${NC}"
     echo -e "SELinux 状态 : ${YELLOW}$SELINUX_STATE${NC}"
     echo -e "系统时区     : ${YELLOW}$CURRENT_TIMEZONE${NC}"
+    echo -e "当前 Locale   : ${YELLOW}$(locale 2>/dev/null | grep "^LANG=" | cut -d= -f2 || echo "未知")${NC}"
     
     # 检测 Root 登录状态
     local root_login=$(grep "^PermitRootLogin" $SSH_CONF | awk '{print $2}')
@@ -501,6 +502,94 @@ uninstall_ss() {
     echo -e "${GREEN}SS 卸载完成！${NC}"
 }
 
+# --- 安装中文字体和 Locale ---
+install_chinese_support() {
+    echo -e "\n${YELLOW}[操作] 正在安装中文字体和 Locale...${NC}"
+    
+    # 根据系统类型安装软件包
+    if [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; then
+        echo -e "${BLUE}检测到 Debian/Ubuntu 系统，正在安装软件包...${NC}"
+        apt-get update && apt-get install -y locales language-pack-zh-hans fonts-wqy-zenhei fonts-wqy-microhei ttf-wqy-zenhei xfonts-wqy
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}错误: 软件包安装失败，请检查网络或软件源配置${NC}"
+            return 1
+        fi
+    else
+        echo -e "${BLUE}检测到 CentOS/RHEL 系统，正在安装软件包...${NC}"
+        # 兼容 CentOS 7 (glibc-common) 和 CentOS 8+ (glibc-langpack-zh)
+        yum install -y glibc-langpack-zh glibc-common wqy-zenhei-fonts wqy-microhei-fonts 2>/dev/null || true
+    fi
+    
+    # 检查并创建配置文件
+    [ ! -f /etc/environment ] && touch /etc/environment
+    [ ! -f /etc/profile ] && touch /etc/profile
+    
+    # 配置 /etc/environment
+    echo -e "${BLUE}配置 /etc/environment...${NC}"
+    if ! grep -q "^LANG=" /etc/environment; then
+        echo 'LANG="zh_CN.UTF-8"' >> /etc/environment
+        echo -e "${GREEN}已添加 LANG 配置${NC}"
+    else
+        echo -e "${YELLOW}LANG 配置已存在，跳过${NC}"
+    fi
+    
+    if ! grep -q "^LANGUAGE=" /etc/environment; then
+        echo 'LANGUAGE="zh_CN:zh:en_US:en"' >> /etc/environment
+        echo -e "${GREEN}已添加 LANGUAGE 配置${NC}"
+    else
+        echo -e "${YELLOW}LANGUAGE 配置已存在，跳过${NC}"
+    fi
+    
+    # 配置 /etc/profile
+    echo -e "${BLUE}配置 /etc/profile...${NC}"
+    if ! grep -q "export LANG=" /etc/profile; then
+        echo 'export LANG=zh_CN.UTF-8' >> /etc/profile
+        echo -e "${GREEN}已添加 export LANG${NC}"
+    else
+        echo -e "${YELLOW}export LANG 已存在，跳过${NC}"
+    fi
+    
+    if ! grep -q "export LANGUAGE=" /etc/profile; then
+        echo 'export LANGUAGE=zh_CN:zh' >> /etc/profile
+        echo -e "${GREEN}已添加 export LANGUAGE${NC}"
+    else
+        echo -e "${YELLOW}export LANGUAGE 已存在，跳过${NC}"
+    fi
+    
+    # 执行 locale 生成
+    echo -e "${BLUE}生成中文 Locale...${NC}"
+    if [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; then
+        locale-gen zh_CN.UTF-8
+        update-locale LANG=zh_CN.UTF-8
+    else
+        localectl set-locale LANG=zh_CN.UTF-8
+    fi
+    
+    # 立即生效当前会话
+    export LANG=zh_CN.UTF-8
+    export LANGUAGE=zh_CN:zh
+    
+    # 验证 Locale 是否成功生成
+    echo -e "${BLUE}验证中文 Locale...${NC}"
+    if ! locale -a 2>/dev/null | grep -qi "zh_CN"; then
+        echo -e "${YELLOW}警告: 中文 Locale 可能未成功生成，请执行 locale -a 手动检查${NC}"
+    else
+        echo -e "${GREEN}中文 Locale 验证成功${NC}"
+    fi
+    
+    # 显示成功信息
+    echo -e "\n${GREEN}========================================${NC}"
+    echo -e "${GREEN}中文字体和 Locale 安装完成！${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "当前 Locale 设置:"
+    locale 2>/dev/null | grep "^LANG=" || echo "LANG=zh_CN.UTF-8 (已配置)"
+    echo -e "\n${YELLOW}提示:${NC}"
+    echo -e "  • 当前会话已生效"
+    echo -e "  • 新会话请重新登录或执行: ${GREEN}source /etc/profile${NC}"
+    echo -e "  • Windows PuTTY 用户请在 窗口→翻译 中设置字符集为 UTF-8"
+    echo -e "${GREEN}========================================${NC}\n"
+}
+
 # SS 管理二级菜单
 ss_menu() {
     while true; do
@@ -554,17 +643,19 @@ fi
 check_root
 while true; do
     check_status
-    echo "1) 一键启用 Root 密钥登录"
-    echo "2) 修改或新增 SSH 端口"
-    echo "3) 修改系统时区为 Asia/Shanghai"
-    echo "4) SS 管理"
+    echo "1) SS 管理"
+    echo "2) 一键启用 Root 密钥登录"
+    echo "3) 修改或新增 SSH 端口"
+    echo "4) 修改系统时区为 Asia/Shanghai"
+    echo "5) 安装中文字体和 Locale"
     echo "q) 退出"
     read -p "选择操作: " opt
     case $opt in
-        1) enable_key_login; read -n 1 -p "按任意键继续..." ;;
-        2) change_port; read -n 1 -p "按任意键继续..." ;;
-        3) change_timezone; read -n 1 -p "按任意键继续..." ;;
-        4) ss_menu ;;
+        1) ss_menu ;;
+        2) enable_key_login; read -n 1 -p "按任意键继续..." ;;
+        3) change_port; read -n 1 -p "按任意键继续..." ;;
+        4) change_timezone; read -n 1 -p "按任意键继续..." ;;
+        5) install_chinese_support; read -n 1 -p "按任意键继续..." ;;
         q) exit 0 ;;
         *) echo "无效选项" ;;
     esac
