@@ -662,7 +662,8 @@ install_chinese_support() {
     # 根据系统类型安装软件包
     if [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; then
         echo -e "${BLUE}检测到 Debian/Ubuntu 系统，正在安装软件包...${NC}"
-        apt-get update && apt-get install -y locales language-pack-zh-hans fonts-wqy-zenhei fonts-wqy-microhei ttf-wqy-zenhei xfonts-wqy
+        apt-get update && apt-get install -y locales language-pack-zh-hans language-pack-zh-hans-base \
+            fonts-wqy-zenhei fonts-wqy-microhei ttf-wqy-zenhei xfonts-wqy manpages-zh
         if [ $? -ne 0 ]; then
             echo -e "${RED}错误: 软件包安装失败，请检查网络或软件源配置${NC}"
             return 1
@@ -722,6 +723,12 @@ install_chinese_support() {
     export LANG=zh_CN.UTF-8
     export LANGUAGE=zh_CN:zh
     
+    # 重新配置相关系统包以应用语言设置（Ubuntu特有）
+    if [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; then
+        echo -e "${BLUE}重新配置系统组件以应用中文...${NC}"
+        dpkg-reconfigure -f noninteractive locales 2>/dev/null || true
+    fi
+    
     # 验证 Locale 是否成功生成
     echo -e "${BLUE}验证中文 Locale...${NC}"
     if ! locale -a 2>/dev/null | grep -qi "zh_CN"; then
@@ -738,7 +745,8 @@ install_chinese_support() {
     locale 2>/dev/null | grep "^LANG=" || echo "LANG=zh_CN.UTF-8 (已配置)"
     echo -e "\n${YELLOW}提示:${NC}"
     echo -e "  • 当前会话已生效"
-    echo -e "  • 新会话请重新登录或执行: ${GREEN}source /etc/profile${NC}"
+    echo -e "  • ${RED}必须完全退出并重新登录${NC}才能使系统欢迎信息显示中文"
+    echo -e "  • 执行 ${GREEN}exit${NC} 退出，然后重新 SSH 登录"
     echo -e "  • Windows PuTTY 用户请在 窗口→翻译 中设置字符集为 UTF-8"
     echo -e "${GREEN}========================================${NC}\n"
 }
