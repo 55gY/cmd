@@ -6,6 +6,9 @@ GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
+BOLD='\033[1m'
+GREEN_BOLD='\033[1;32m'
+RED_BOLD='\033[1;31m'
 
 SSH_CONF="/etc/ssh/sshd_config"
 AUTH_KEYS="/root/.ssh/authorized_keys"
@@ -141,11 +144,26 @@ check_status() {
     clear
     detect_os
     echo -e "${BLUE}================ 系统与 SSH 环境状态 ================${NC}"
-    echo -e "操作系统     : ${YELLOW}$OS_NAME${NC}"
-    echo -e "系统架构     : ${YELLOW}$OS_ARCH${NC}"
-    echo -e "SELinux 状态 : ${YELLOW}$SELINUX_STATE${NC}"
-    echo -e "系统时区     : ${YELLOW}$CURRENT_TIMEZONE${NC}"
-    echo -e "当前 Locale   : ${YELLOW}$(locale 2>/dev/null | grep "^LANG=" | cut -d= -f2 || echo "未知")${NC}"
+    
+    # 使用 printf 对齐输出
+    printf "%-18s: ${GREEN_BOLD}%s${NC}\n" "操作系统" "$OS_NAME"
+    printf "%-18s: ${GREEN_BOLD}%s${NC}\n" "系统架构" "$OS_ARCH"
+    
+    # SELinux 状态（未安装/禁用显示红色）
+    if [[ "$SELINUX_STATE" == "未安装/禁用" ]]; then
+        printf "%-18s: ${RED_BOLD}%s${NC}\n" "SELinux 状态" "$SELINUX_STATE"
+    else
+        printf "%-18s: ${GREEN_BOLD}%s${NC}\n" "SELinux 状态" "$SELINUX_STATE"
+    fi
+    
+    printf "%-18s: ${GREEN_BOLD}%s${NC}\n" "系统时区" "$CURRENT_TIMEZONE"
+    
+    local current_locale=$(locale 2>/dev/null | grep "^LANG=" | cut -d= -f2 || echo "未知")
+    if [[ "$current_locale" == "未知" ]]; then
+        printf "%-18s: ${RED_BOLD}%s${NC}\n" "当前 Locale" "$current_locale"
+    else
+        printf "%-18s: ${GREEN_BOLD}%s${NC}\n" "当前 Locale" "$current_locale"
+    fi
     
     # 检测 Root 登录状态
     local root_login=$(grep "^PermitRootLogin" $SSH_CONF | awk '{print $2}')
@@ -160,30 +178,49 @@ check_status() {
     [ -z "$ports" ] && ports="22(默认)"
     
     # 检测密钥文件
-    local auth_file_status="${RED}不存在${NC}"
-    [ -f "$AUTH_KEYS" ] && auth_file_status="${GREEN}已存在${NC} ($(ls -lh $AUTH_KEYS | awk '{print $5}'))"
+    local auth_file_status="不存在"
+    local auth_file_color="${RED_BOLD}"
+    if [ -f "$AUTH_KEYS" ]; then
+        auth_file_status="已存在 ($(ls -lh $AUTH_KEYS | awk '{print $5}'))"
+        auth_file_color="${GREEN_BOLD}"
+    fi
 
     # 检测 SS 安装状态
-    local ss_status="${RED}未安装${NC}"
+    local ss_status="未安装"
+    local ss_color="${RED_BOLD}"
     if [[ -f "$BINARY_PATH" && -f "$CONFIG_PATH" ]]; then
         if systemctl is-active ss >/dev/null 2>&1; then
-            ss_status="${GREEN}已安装 + 运行中${NC}"
+            ss_status="已安装 + 运行中"
+            ss_color="${GREEN_BOLD}"
         else
-            ss_status="${YELLOW}已安装 未运行${NC}"
+            ss_status="已安装 未运行"
+            ss_color="${YELLOW}"
         fi
     fi
 
-    echo -e "Root 登录     : ${YELLOW}$root_login${NC}"
-    echo -e "密码验证     : ${YELLOW}$pwd_auth${NC}"
-    echo -e "SSH 端口      : ${GREEN}[ $ports ]${NC}"
-    echo -e "密钥文件状态 : $auth_file_status"
-    echo -e "SS 状态       : $ss_status"
+    # Root 登录（yes显示绿色，no显示红色）
+    if [[ "$root_login" =~ ^(yes|YES)$ ]]; then
+        printf "%-18s: ${GREEN_BOLD}%s${NC}\n" "Root 登录" "$root_login"
+    else
+        printf "%-18s: ${RED_BOLD}%s${NC}\n" "Root 登录" "$root_login"
+    fi
+    
+    # 密码验证（no显示绿色更安全，yes显示红色）
+    if [[ "$pwd_auth" =~ ^(no|NO)$ ]]; then
+        printf "%-18s: ${GREEN_BOLD}%s${NC}\n" "密码验证" "$pwd_auth"
+    else
+        printf "%-18s: ${RED_BOLD}%s${NC}\n" "密码验证" "$pwd_auth"
+    fi
+    
+    printf "%-18s: ${GREEN_BOLD}[ %s ]${NC}\n" "SSH 端口" "$ports"
+    printf "%-18s: ${auth_file_color}%s${NC}\n" "密钥文件状态" "$auth_file_status"
+    printf "%-18s: ${ss_color}%s${NC}\n" "SS 状态" "$ss_status"
     
     # BBR 状态显示
     if [[ "$BBR_STATUS" == "已启用" ]]; then
-        echo -e "BBR 加速      : ${GREEN}已启用${NC} (内核 ${KERNEL_VERSION})"
+        printf "%-18s: ${GREEN_BOLD}%s${NC} (内核 ${KERNEL_VERSION})\n" "BBR 加速" "$BBR_STATUS"
     else
-        echo -e "BBR 加速      : ${RED}未启用${NC} (内核 ${KERNEL_VERSION})"
+        printf "%-18s: ${RED_BOLD}%s${NC} (内核 ${KERNEL_VERSION})\n" "BBR 加速" "$BBR_STATUS"
     fi
     
     echo -e "${BLUE}=====================================================${NC}"
@@ -1280,7 +1317,7 @@ check_root
 while true; do
     check_status
     echo "1. SS 管理"
-    echo "2. 启用 TCP BBR 加速 + 系统网络优化"
+    echo "2. 启用 BBR 网络优化"
     echo "3. 一键启用 Root 密钥登录"
     echo "4. 修改或新增 SSH 端口"
     echo "5. 修改系统时区为 Asia/Shanghai"
