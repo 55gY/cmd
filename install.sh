@@ -145,24 +145,24 @@ check_status() {
     detect_os
     echo -e "${BLUE}================ 系统与 SSH 环境状态 ================${NC}"
     
-    # 使用 printf 对齐输出
-    printf "%-18s: ${GREEN_BOLD}%s${NC}\n" "操作系统" "$OS_NAME"
-    printf "%-18s: ${GREEN_BOLD}%s${NC}\n" "系统架构" "$OS_ARCH"
+    # 手动对齐冒号（中文占2个显示宽度）
+    echo -e "操作系统            : ${GREEN_BOLD}$OS_NAME${NC}"
+    echo -e "系统架构            : ${GREEN_BOLD}$OS_ARCH${NC}"
     
     # SELinux 状态（未安装/禁用显示红色）
     if [[ "$SELINUX_STATE" == "未安装/禁用" ]]; then
-        printf "%-18s: ${RED_BOLD}%s${NC}\n" "SELinux 状态" "$SELINUX_STATE"
+        echo -e "SELinux 状态        : ${RED_BOLD}$SELINUX_STATE${NC}"
     else
-        printf "%-18s: ${GREEN_BOLD}%s${NC}\n" "SELinux 状态" "$SELINUX_STATE"
+        echo -e "SELinux 状态        : ${GREEN_BOLD}$SELINUX_STATE${NC}"
     fi
     
-    printf "%-18s: ${GREEN_BOLD}%s${NC}\n" "系统时区" "$CURRENT_TIMEZONE"
+    echo -e "系统时区            : ${GREEN_BOLD}$CURRENT_TIMEZONE${NC}"
     
     local current_locale=$(locale 2>/dev/null | grep "^LANG=" | cut -d= -f2 || echo "未知")
     if [[ "$current_locale" == "未知" ]]; then
-        printf "%-18s: ${RED_BOLD}%s${NC}\n" "当前 Locale" "$current_locale"
+        echo -e "当前 Locale         : ${RED_BOLD}$current_locale${NC}"
     else
-        printf "%-18s: ${GREEN_BOLD}%s${NC}\n" "当前 Locale" "$current_locale"
+        echo -e "当前 Locale         : ${GREEN_BOLD}$current_locale${NC}"
     fi
     
     # 检测 Root 登录状态
@@ -200,27 +200,27 @@ check_status() {
 
     # Root 登录（yes显示绿色，no显示红色）
     if [[ "$root_login" =~ ^(yes|YES)$ ]]; then
-        printf "%-18s: ${GREEN_BOLD}%s${NC}\n" "Root 登录" "$root_login"
+        echo -e "Root 登录           : ${GREEN_BOLD}$root_login${NC}"
     else
-        printf "%-18s: ${RED_BOLD}%s${NC}\n" "Root 登录" "$root_login"
+        echo -e "Root 登录           : ${RED_BOLD}$root_login${NC}"
     fi
     
     # 密码验证（no显示绿色更安全，yes显示红色）
     if [[ "$pwd_auth" =~ ^(no|NO)$ ]]; then
-        printf "%-18s: ${GREEN_BOLD}%s${NC}\n" "密码验证" "$pwd_auth"
+        echo -e "密码验证            : ${GREEN_BOLD}$pwd_auth${NC}"
     else
-        printf "%-18s: ${RED_BOLD}%s${NC}\n" "密码验证" "$pwd_auth"
+        echo -e "密码验证            : ${RED_BOLD}$pwd_auth${NC}"
     fi
     
-    printf "%-18s: ${GREEN_BOLD}[ %s ]${NC}\n" "SSH 端口" "$ports"
-    printf "%-18s: ${auth_file_color}%s${NC}\n" "密钥文件状态" "$auth_file_status"
-    printf "%-18s: ${ss_color}%s${NC}\n" "SS 状态" "$ss_status"
+    echo -e "SSH 端口            : ${GREEN_BOLD}$ports${NC}"
+    echo -e "密钥文件状态        : ${auth_file_color}$auth_file_status${NC}"
+    echo -e "SS 状态             : ${ss_color}$ss_status${NC}"
     
     # BBR 状态显示
     if [[ "$BBR_STATUS" == "已启用" ]]; then
-        printf "%-18s: ${GREEN_BOLD}%s${NC} (内核 ${KERNEL_VERSION})\n" "BBR 加速" "$BBR_STATUS"
+        echo -e "BBR 加速            : ${GREEN_BOLD}$BBR_STATUS${NC} (内核 ${KERNEL_VERSION})"
     else
-        printf "%-18s: ${RED_BOLD}%s${NC} (内核 ${KERNEL_VERSION})\n" "BBR 加速" "$BBR_STATUS"
+        echo -e "BBR 加速            : ${RED_BOLD}$BBR_STATUS${NC} (内核 ${KERNEL_VERSION})"
     fi
     
     echo -e "${BLUE}=====================================================${NC}"
