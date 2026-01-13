@@ -169,8 +169,29 @@ check_status() {
     local root_login=$(grep "^PermitRootLogin" $SSH_CONF | awk '{print $2}')
     [ -z "$root_login" ] && root_login="默认(prohibit-password)"
     
-    # 检测密码验证状态
-    local pwd_auth=$(grep "^PasswordAuthentication" $SSH_CONF | awk '{print $2}')
+    # 检测密码验证状态（优先检查云平台配置）
+    local pwd_auth=""
+    local config_dir="/etc/ssh/sshd_config.d"
+    
+    # 首先检查云平台配置文件
+    if [ -d "$config_dir" ]; then
+        for conf_file in "60-cloudimg-settings.conf" "50-cloud-init.conf" "99-cloudimg-settings.conf"; do
+            if [ -f "$config_dir/$conf_file" ]; then
+                local cloud_pwd=$(grep "^PasswordAuthentication" "$config_dir/$conf_file" 2>/dev/null | awk '{print $2}')
+                if [ -n "$cloud_pwd" ]; then
+                    pwd_auth="$cloud_pwd"
+                    break
+                fi
+            fi
+        done
+    fi
+    
+    # 如果云平台配置中没有，检查主配置文件
+    if [ -z "$pwd_auth" ]; then
+        pwd_auth=$(grep "^PasswordAuthentication" $SSH_CONF 2>/dev/null | awk '{print $2}')
+    fi
+    
+    # 如果还是没找到，默认为yes
     [ -z "$pwd_auth" ] && pwd_auth="yes(默认)"
     
     # 检测端口
@@ -233,6 +254,9 @@ set_ssh_config() {
     local value="$2"
     local pattern="^#\\?${key}"
     
+    # 转义 value 中的特殊字符（用于 sed）
+    local escaped_value=$(echo "$value" | sed 's/[&/\\]/\\&/g')
+    
     # 检查是否存在 sshd_config.d 目录
     local config_dir="/etc/ssh/sshd_config.d"
     local cloud_config=""
@@ -246,7 +270,7 @@ set_ssh_config() {
                 echo -e "${BLUE}  检测到云平台配置: $conf_file${NC}"
                 # 修改云平台配置文件
                 if grep -q "$pattern" "$cloud_config"; then
-                    sed -i "s/$pattern.*/${key} ${value}/" "$cloud_config"
+                    sed -i "s/$pattern.*/${key} ${escaped_value}/" "$cloud_config"
                     echo -e "${GREEN}  ✓ 已更新 $conf_file 中的 $key${NC}"
                 fi
             fi
@@ -255,7 +279,7 @@ set_ssh_config() {
     
     # 同时修改主配置文件
     if grep -q "$pattern" "$SSH_CONF"; then
-        sed -i "s/$pattern.*/${key} ${value}/" "$SSH_CONF"
+        sed -i "s/$pattern.*/${key} ${escaped_value}/" "$SSH_CONF"
     else
         echo "${key} ${value}" >> "$SSH_CONF"
     fi
