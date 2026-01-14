@@ -1148,6 +1148,9 @@ net.core.netdev_max_backlog = 32768
 net.ipv4.tcp_timestamps = 0
 net.ipv4.tcp_max_orphans = 32768
 
+# PTY 最大数量（防止 SSH 连接被拒绝）
+kernel.pty.max = 4096
+
 # forward ipv4 (取消注释以启用)
 #net.ipv4.ip_forward = 1
 
@@ -1175,9 +1178,50 @@ EOF
         echo -e "${YELLOW}ulimit 配置已存在，跳过${NC}"
     fi
     
+    # 配置 SSH 连接保活和会话限制
+    echo -e "${BLUE}配置 SSH 连接保活参数...${NC}"
+    
+    # 备份 SSH 配置
+    if [ -f /etc/ssh/sshd_config ]; then
+        cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)
+    fi
+    
+    # 删除旧的配置（如果存在）
+    sed -i '/^ClientAliveInterval/d' /etc/ssh/sshd_config
+    sed -i '/^ClientAliveCountMax/d' /etc/ssh/sshd_config
+    sed -i '/^MaxSessions/d' /etc/ssh/sshd_config
+    sed -i '/^MaxStartups/d' /etc/ssh/sshd_config
+    
+    # 添加新配置到文件末尾
+    cat >> /etc/ssh/sshd_config <<-EOF
+
+# SSH 连接保活配置（防止断线）- 添加于 $(date +%Y-%m-%d)
+# 每 30 秒发一次心跳
+ClientAliveInterval 30
+# 如果连续 3 次没回应（即 90 秒），才彻底断开
+ClientAliveCountMax 3
+# 最大允许开启的会话数
+MaxSessions 100
+# 最大允许建立的连接数
+MaxStartups 10:30:100
+EOF
+    
+    echo -e "${GREEN}✓ 已配置 SSH 连接保活参数${NC}"
+    
     # 应用配置
     sysctl -p >/dev/null 2>&1
     source /etc/profile 2>/dev/null || true
+    
+    # 重启 SSH 服务使配置生效
+    echo -e "${BLUE}重启 SSH 服务使配置生效...${NC}"
+    detect_os  # 确保 SERVICE_NAME 变量已设置
+    systemctl restart $SERVICE_NAME 2>/dev/null || service $SERVICE_NAME restart 2>/dev/null
+    
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✓ SSH 服务已重启${NC}"
+    else
+        echo -e "${YELLOW}⚠ SSH 服务重启可能失败，建议手动检查${NC}"
+    fi
     
     echo -e "${GREEN}✓ 系统网络优化配置完成${NC}"
 }
