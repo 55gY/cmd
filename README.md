@@ -18,6 +18,8 @@ bash <(curl -Ls https://raw.githubusercontent.com/55gY/cmd/main/cmd.sh)
 ./cmd.sh ss auto
 ```
 
+目前 `Mihomo` 暂未提供类似 `ss auto` / `ss config` 的非交互命令行参数，请通过交互菜单进入管理。
+
 ## 主要功能
 
 ### 1. SSH 安全管理
@@ -35,12 +37,19 @@ bash <(curl -Ls https://raw.githubusercontent.com/55gY/cmd/main/cmd.sh)
 - 系统网络优化（TCP 参数、文件描述符、SSH 保活）
 - 虚拟化环境兼容性检测
 
-### 4. 系统配置
+### 4. Mihomo 代理管理
+- 一键安装/重置 Mihomo（多架构支持，systemd 服务管理）
+- 自动生成默认配置（支持订阅、Mixed Port、TUN）
+- 支持修改订阅地址
+- 提供外网真实延迟测试
+- 一键卸载
+
+### 5. 系统配置
 - 修改系统时区（Asia/Shanghai）
 - 一键安装中文字体（WQY）和 Locale（zh_CN.UTF-8）
 
-### 5. 系统状态面板
-- 实时显示系统信息（OS、架构、时区、Locale、SSH 状态、SS 状态、BBR 状态等）
+### 6. 系统状态面板
+- 实时显示系统信息（OS、架构、时区、Locale、SSH 状态、SS 状态、Mihomo 状态、BBR 状态等）
 
 ## 系统要求
 - **支持的系统**：Ubuntu, Debian, CentOS, RHEL, Fedora, Rocky Linux, AlmaLinux
@@ -54,6 +63,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/55gY/cmd/main/cmd.sh)
 - ✅ SSH 配置语法检测
 - ✅ 强密码自动生成（SS）
 - ✅ 现代化加密算法（2022-blake3-aes-256-gcm）
+- ✅ Mihomo 配置文件与 systemd 服务统一管理
 - ✅ 防火墙自动配置
 - ✅ SELinux 策略自动处理
 
@@ -61,8 +71,9 @@ bash <(curl -Ls https://raw.githubusercontent.com/55gY/cmd/main/cmd.sh)
 1. **首次使用**：建议先查看系统状态面板，了解当前配置
 2. **SSH 密钥登录**：配置后务必测试密钥登录成功再断开当前会话
 3. **BBR 加速**：内核升级有风险，建议在测试环境先验证
-4. **中文环境**：配置后需完全退出并重新登录才能显示中文欢迎信息
-5. **端口修改**：建议保留 22 端口以防配置错误导致无法登录
+4. **Mihomo 配置**：首次安装后请及时修改订阅地址、控制面板密钥等默认配置
+5. **中文环境**：配置后需完全退出并重新登录才能显示中文欢迎信息
+6. **端口修改**：建议保留 22 端口以防配置错误导致无法登录
 
 ## 兼容性说明
 - 自动识别并兼容 Debian/Ubuntu 系统的 SSH 服务名（ssh）
