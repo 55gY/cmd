@@ -24,7 +24,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/55gY/cmd/main/cmd.sh)
 
 ### 1. SSH 安全管理
 - 一键启用 Root 密钥登录（4096 位 RSA，自动清理云平台限制）
-- 修改/新增 SSH 端口（自动配置防火墙和 SELinux）
+- 修改/新增 SSH 端口（自动配置防火墙、SELinux，并兼容 systemd `ssh.socket` / `sshd.socket` 监听端口覆盖）
 
 ### 2. SS 代理管理
 - 一键安装/重置 Shadowsocks（最新版本，多架构支持）
@@ -59,7 +59,6 @@ bash <(curl -Ls https://raw.githubusercontent.com/55gY/cmd/main/cmd.sh)
 
 ## 安全特性
 - ✅ 自动检测云平台配置文件并处理
-- ✅ 配置修改前自动备份
 - ✅ SSH 配置语法检测
 - ✅ 强密码自动生成（SS）
 - ✅ 现代化加密算法（2022-blake3-aes-256-gcm）

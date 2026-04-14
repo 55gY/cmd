@@ -594,6 +594,59 @@ set_ssh_config() {
     echo -e "${GREEN}  ✓ 已更新主配置文件中的 $key${NC}"
 }
 
+configure_ssh_socket_ports() {
+    local mode="$1"
+    local new_port="$2"
+    local socket_unit="${SERVICE_NAME}.socket"
+    local dropin_dir="/etc/systemd/system/${socket_unit}.d"
+    local override_file="$dropin_dir/override.conf"
+    local current_ports=""
+    local final_ports=()
+    local port
+
+    if ! systemctl list-unit-files "$socket_unit" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if ! systemctl is-enabled "$socket_unit" >/dev/null 2>&1 && ! systemctl is-active "$socket_unit" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    current_ports=$(systemctl show -p Listen "$socket_unit" 2>/dev/null | sed 's/^Listen=//')
+    if [ -n "$current_ports" ]; then
+        while IFS= read -r port; do
+            port=$(echo "$port" | sed 's/.*://')
+            if [[ "$port" =~ ^[0-9]+$ ]]; then
+                final_ports+=("$port")
+            fi
+        done <(echo "$current_ports" | tr ' ' '\n')
+    fi
+
+    if [[ "$mode" =~ ^[Aa]$ ]]; then
+        if [ ${#final_ports[@]} -eq 0 ]; then
+            final_ports=("22")
+        fi
+        if [[ ! " ${final_ports[*]} " =~ " ${new_port} " ]]; then
+            final_ports+=("$new_port")
+        fi
+    else
+        final_ports=("$new_port")
+    fi
+
+    mkdir -p "$dropin_dir"
+
+    {
+        echo "[Socket]"
+        echo "ListenStream="
+        for port in "${final_ports[@]}"; do
+            echo "ListenStream=${port}"
+        done
+    } > "$override_file"
+
+    systemctl daemon-reload
+    echo -e "${GREEN}  ✓ 已更新 ${socket_unit} 的监听端口: ${final_ports[*]}${NC}"
+}
+
 # 重启 SSH 服务 (兼容多系统)
 restart_service() {
     echo -e "${BLUE}正在校验配置并重启 $SERVICE_NAME 服务...${NC}"
@@ -755,6 +808,10 @@ change_port() {
     echo -e "\n${YELLOW}[操作] 修改/新增 SSH 端口...${NC}"
     read -p "请输入新端口号 (1-65535): " new_port
     [[ ! "$new_port" =~ ^[0-9]+$ ]] && echo "无效输入" && return
+    if [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+        echo -e "${RED}端口号超出范围，请输入 1-65535 之间的值${NC}"
+        return
+    fi
 
     # 修改配置逻辑
     read -p "模式: [A]追加(保留22) | [R]替换(仅新端口): " p_mode
@@ -764,6 +821,8 @@ change_port() {
     else
         sed -i "s/^#\?Port.*/Port $new_port/" $SSH_CONF
     fi
+
+    configure_ssh_socket_ports "$p_mode" "$new_port"
 
     # A. 处理防火墙
     if command -v ufw >/dev/null; then
