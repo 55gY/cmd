@@ -604,55 +604,61 @@ configure_ssh_socket_ports() {
     local final_ports=()
     local port
 
+    # 检查 socket 单元是否存在
     if ! systemctl list-unit-files "$socket_unit" >/dev/null 2>&1; then
         return 0
     fi
 
+    # 检查是否启用
     if ! systemctl is-enabled "$socket_unit" >/dev/null 2>&1 && ! systemctl is-active "$socket_unit" >/dev/null 2>&1; then
         return 0
     fi
 
+    # 获取当前监听端口
     current_ports=$(systemctl show -p Listen "$socket_unit" 2>/dev/null | sed 's/^Listen=//')
+
+    # 【关键修复区】采用最稳健的空格分割遍历，彻底避开 <<< 和 tr 引发的解析错误
     if [ -n "$current_ports" ]; then
-        while IFS= read -r port; do
-            port=$(echo "$port" | sed 's/.*://')
+        for p_item in $current_ports; do
+            # 提取端口号 (处理类似 [::]:22 或 0.0.0.0:22 的格式)
+            port=$(echo "$p_item" | sed 's/.*://')
             if [[ "$port" =~ ^[0-9]+$ ]]; then
                 final_ports+=("$port")
             fi
-        if [ -n "$current_ports" ]; then
-            for port in $current_ports; do
-                port=$(echo "$port" | sed 's/.*://')
-                if [[ "$port" =~ ^[0-9]+$ ]]; then
-                    final_ports+=("$port")
-                fi
-            done
-        fi
+        done
     fi
 
+    # 根据模式（追加或替换）处理端口数组
     if [[ "$mode" =~ ^[Aa]$ ]]; then
         if [ ${#final_ports[@]} -eq 0 ]; then
             final_ports=("22")
         fi
-        if [[ ! " ${final_ports[*]} " =~ " ${new_port} " ]]; then
+        # 如果新端口不在数组中，则添加
+        local found=0
+        for p in "${final_ports[@]}"; do
+            [[ "$p" == "$new_port" ]] && found=1
+        done
+        if [ "$found" -eq 0 ]; then
             final_ports+=("$new_port")
         fi
     else
+        # 替换模式，只保留新端口
         final_ports=("$new_port")
     fi
 
+    # 写入配置
     mkdir -p "$dropin_dir"
-
     {
         echo "[Socket]"
         echo "ListenStream="
-        for port in "${final_ports[@]}"; do
-            echo "ListenStream=${port}"
+        for p in "${final_ports[@]}"; do
+            echo "ListenStream=${p}"
         done
     } > "$override_file"
 
     systemctl daemon-reload
     echo -e "${GREEN}  ✓ 已更新 ${socket_unit} 的监听端口: ${final_ports[*]}${NC}"
-}
+} # <--- 确保函数闭合
 
 # 重启 SSH 服务 (兼容多系统)
 restart_service() {
