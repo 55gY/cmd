@@ -619,7 +619,7 @@ configure_ssh_socket_ports() {
             if [[ "$port" =~ ^[0-9]+$ ]]; then
                 final_ports+=("$port")
             fi
-        done <(echo "$current_ports" | tr ' ' '\n')
+        while IFS= read -r port; do ...; done <<< "$(tr ' ' '\n' <<< "$current_ports")"
     fi
 
     if [[ "$mode" =~ ^[Aa]$ ]]; then
