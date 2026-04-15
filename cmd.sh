@@ -619,7 +619,7 @@ configure_ssh_socket_ports() {
             if [[ "$port" =~ ^[0-9]+$ ]]; then
                 final_ports+=("$port")
             fi
-        done <<< "$(tr ' '\n' <<< "$current_ports")"
+            done <<< "$(tr ' '\n' <<< "$current_ports")"
     fi
 
     if [[ "$mode" =~ ^[Aa]$ ]]; then
@@ -671,9 +671,9 @@ enable_key_login() {
         echo -e "${RED}检测到云平台的 root 登录限制！${NC}"
         echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo -e "${YELLOW}当前 authorized_keys 包含阻止 root 登录的命令${NC}"
-        echo -e "${BLUE}示例: command=\"echo 'Please login...'\"${NC}"
-        echo ""
-        read -p "是否清理此限制以允许 root 登录？(y/n): " clean_restriction
+        # 【修复点3】将提示文字简化，确保括号不触发解析器 bug
+        printf "${CYAN}是否清理此限制以允许 root 登录? [y/n]: ${NC}"
+        read -r clean_restriction
         
         if [[ "$clean_restriction" =~ ^[Yy]$ ]]; then
             echo -e "${BLUE}正在清理云平台限制...${NC}"
@@ -1413,45 +1413,44 @@ install_kernel() {
             ;;
         ubuntu|debian)
             echo -e "${BLUE}检测到 Ubuntu/Debian 系统${NC}"
-            echo -e "${YELLOW}正在从 Ubuntu Mainline 获取最新内核列表...${NC}"
+            echo -e "${YELLOW}正在获取最新内核列表...${NC}"
             
-            # 获取内核版本列表
-            local latest_version=($(wget -qO- https://kernel.ubuntu.com/~kernel-ppa/mainline/ | awk -F'"v' '/v[4-9]./{print $2}' | cut -d/ -f1 | grep -v - | sort -V))
+            # 【修复点1】改用 grep 提取，彻底解决引号嵌套导致的渲染崩溃
+            local latest_version=($(wget -qO- https://kernel.ubuntu.com/~kernel-ppa/mainline/ | grep -oE 'v[4-9]\.[0-9]+\.[0-9]+' | tr -d 'v' | sort -V))
             
             if [ ${#latest_version[@]} -eq 0 ]; then
                 echo -e "${RED}获取内核版本列表失败${NC}"
                 return 1
             fi
             
-            # 筛选 5.15+ 版本
             local kernel_arr=()
-            for i in ${latest_version[@]}; do
-                if _version_ge $i 5.15; then
-                    kernel_arr+=($i)
+            for i in "${latest_version[@]}"; do
+                if _version_ge "$i" "5.15"; then
+                    kernel_arr+=("$i")
                 fi
             done
             
             if [ ${#kernel_arr[@]} -eq 0 ]; then
-                echo -e "${RED}未找到符合条件的内核版本（≥5.15）${NC}"
+                echo -e "${RED}未找到符合条件的内核版本${NC}"
                 return 1
             fi
             
-            # 选择最新版本
-            local kernel=${kernel_arr[-1]}
+            # 使用正向索引获取最后一个元素，避免旧版本 Bash 对 [-1] 的兼容性问题
+            local kernel=${kernel_arr[$((${#kernel_arr[@]}-1))]}
             echo -e "${GREEN}选择内核版本: ${kernel}${NC}"
             
-            # 下载内核
             local deb_name deb_modules_name
+            # 【修复点2】使用正则精准匹配，不使用 awk -F 这种容易断开渲染的写法
             if [[ "$IS_64BIT" == "true" ]]; then
-                deb_name=$(wget -qO- https://kernel.ubuntu.com/~kernel-ppa/mainline/v${kernel}/ | grep "linux-image" | grep "generic" | awk -F'">' '/amd64.deb/{print $2}' | cut -d'<' -f1 | head -1)
-                deb_modules_name=$(wget -qO- https://kernel.ubuntu.com/~kernel-ppa/mainline/v${kernel}/ | grep "linux-modules" | grep "generic" | awk -F'">' '/amd64.deb/{print $2}' | cut -d'<' -f1 | head -1)
+                deb_name=$(wget -qO- "https://kernel.ubuntu.com/~kernel-ppa/mainline/v${kernel}/" | grep -oE 'linux-image-[^"]*-generic[^"]*amd64\.deb' | head -1)
+                deb_modules_name=$(wget -qO- "https://kernel.ubuntu.com/~kernel-ppa/mainline/v${kernel}/" | grep -oE 'linux-modules-[^"]*-generic[^"]*amd64\.deb' | head -1)
             else
-                deb_name=$(wget -qO- https://kernel.ubuntu.com/~kernel-ppa/mainline/v${kernel}/ | grep "linux-image" | grep "generic" | awk -F'">' '/i386.deb/{print $2}' | cut -d'<' -f1 | head -1)
-                deb_modules_name=$(wget -qO- https://kernel.ubuntu.com/~kernel-ppa/mainline/v${kernel}/ | grep "linux-modules" | grep "generic" | awk -F'">' '/i386.deb/{print $2}' | cut -d'<' -f1 | head -1)
+                deb_name=$(wget -qO- "https://kernel.ubuntu.com/~kernel-ppa/mainline/v${kernel}/" | grep -oE 'linux-image-[^"]*-generic[^"]*i386\.deb' | head -1)
+                deb_modules_name=$(wget -qO- "https://kernel.ubuntu.com/~kernel-ppa/mainline/v${kernel}/" | grep -oE 'linux-modules-[^"]*-generic[^"]*i386\.deb' | head -1)
             fi
             
             if [ -z "${deb_name}" ]; then
-                echo -e "${RED}获取内核包名称失败，该内核可能构建失败${NC}"
+                echo -e "${RED}内核包获取失败${NC}"
                 return 1
             fi
             
