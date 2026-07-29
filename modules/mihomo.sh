@@ -452,12 +452,10 @@ prepare_upgrade_if_needed() {
         service_running=1
     fi
 
-    if [ "$service_running" -eq 1 ]; then
-        printf "${YELLOW}检测到 Mihomo 已安装，且服务正在运行。是否覆盖升级并保留现有配置？(y/n):${NC} "
-    else
-        printf "${YELLOW}检测到 Mihomo 已安装。是否覆盖升级并保留现有配置？(y/n):${NC} "
-    fi
-    read -r answer
+    local _q="检测到 Mihomo 已安装。是否覆盖升级并保留现有配置？"
+    [ "$service_running" -eq 1 ] && _q="检测到 Mihomo 已安装，且服务正在运行。是否覆盖升级并保留现有配置？"
+    local answer=y
+    confirm "${YELLOW}${_q}${NC}" || answer=n
 
     if [ "$answer" != "y" ]; then
         echo "已取消覆盖安装。"
@@ -531,9 +529,7 @@ apply_default_config() {
         return 1
     fi
     if [ -f "$CONFIG_FILE" ]; then
-        printf "${RED}配置文件已存在，是否覆盖？(y/n):${NC} "
-        read -r answer
-        if [ "$answer" != "y" ]; then
+        if ! confirm "${RED}配置文件已存在，是否覆盖？${NC}"; then
             echo "取消覆盖。"
             return 1
         fi
@@ -787,10 +783,8 @@ run_latency_test() {
 }
 
 uninstall_mihomo() {
-    local confirm
     echo "即将卸载 Mihomo 及相关配置。"
-    read -r -p "确认继续？(y/n): " confirm
-    if [ "$confirm" != "y" ]; then
+    if ! confirm "确认继续？"; then
         echo "已取消卸载。"
         return 0
     fi
@@ -799,13 +793,21 @@ uninstall_mihomo() {
         systemctl stop mihomo >/dev/null 2>&1 || true
         systemctl disable mihomo >/dev/null 2>&1 || true
     fi
+    # 先取出端口, 便于回收可能存在的防火墙放行
+    local old_port; old_port=$(mihomo_get_port)
+
     rm -f "$CORE_BIN"
     rm -f "$SERVICE_FILE"
     rm -rf "$CONFIG_DIR"
+    rm -rf /etc/systemd/system/mihomo.service.d
+    # 清理本脚本新增的日志目录
+    rm -rf "$LOG_DIR"
     if _exists systemctl; then
         systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed mihomo >/dev/null 2>&1 || true
     fi
-    echo "卸载完成。"
+    [ -n "$old_port" ] && close_firewall "$old_port" tcp udp
+    echo "卸载完成, 相关文件已清理。"
 }
 
 # Mihomo 状态检测面板 (统一样式)

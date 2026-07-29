@@ -194,8 +194,7 @@ install_ss() {
     if [[ -e ${BINARY_PATH} ]]; then
         echo -e "${YELLOW}检测到 SS 已安装，将重置配置...${NC}"
         if [[ "$auto_confirm" != "true" ]]; then
-            read -p "是否继续？(y/n): " confirm
-            [[ ! "$confirm" =~ ^[Yy]$ ]] && return
+            confirm "是否继续？" || return
         else
             echo -e "${GREEN}[自动模式] 自动确认重置配置${NC}"
         fi
@@ -237,17 +236,25 @@ uninstall_ss() {
         return
     fi
     
-    echo -e "\n${RED}确定要卸载 SS ? (y/N)${NC}"
-    read -e -p "请确认: " unyn
-    [[ ! "$unyn" =~ ^[Yy]$ ]] && echo -e "${YELLOW}卸载已取消${NC}" && return
+    echo ""
+    confirm "${RED}确定要卸载 SS ?${NC}" || { echo -e "${YELLOW}卸载已取消${NC}"; return; }
     
     echo -e "${BLUE}正在卸载 SS...${NC}"
+    # 先取出端口(配置删除后读不到), 用于回收防火墙放行
+    local old_port; old_port=$(ss_get_port)
+
     systemctl stop ss 2>/dev/null
     systemctl disable ss 2>/dev/null
     rm -f /etc/systemd/system/ss.service
-    systemctl daemon-reload
+    rm -rf /etc/systemd/system/ss.service.d
+    systemctl daemon-reload 2>/dev/null
+    systemctl reset-failed ss >/dev/null 2>&1
     rm -rf "${INSTALL_DIR}"
-    echo -e "${GREEN}SS 卸载完成！${NC}"
+
+    # 回收安装时放行的防火墙端口 (SS 为 tcp+udp)
+    [ -n "$old_port" ] && close_firewall "$old_port" tcp udp
+
+    echo -e "${GREEN}SS 卸载完成, 相关文件已清理！${NC}"
 }
 
 # SS 状态检测面板 (统一样式)

@@ -103,7 +103,7 @@ check_root
 while true; do
     check_status
     echo "1. SS 管理"
-    echo "2. 启用 BBR 网络优化"
+    echo "2. BBR 网络优化管理"
     echo "3. 一键启用 Root 密钥登录"
     echo "4. 修改或新增 SSH 端口"
     echo "5. 修改系统时区为 Asia/Shanghai"
@@ -114,7 +114,7 @@ while true; do
     read -p "选择操作: " opt
     case $opt in
         1) load_module ss     && ss_menu ;;
-        2) load_module bbr    && { bbr_status_panel; enable_bbr; read -n 1 -p "按任意键继续..."; } ;;
+        2) load_module bbr    && bbr_menu ;;
         3) load_module ssh    && { ssh_status_panel; enable_key_login; read -n 1 -p "按任意键继续..."; } ;;
         4) load_module ssh    && { ssh_status_panel; change_port; read -n 1 -p "按任意键继续..."; } ;;
         5) load_module system && { system_status_panel; change_timezone; read -n 1 -p "按任意键继续..."; } ;;

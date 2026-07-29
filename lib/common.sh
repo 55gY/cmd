@@ -204,6 +204,18 @@ reality_get_port() {
     echo "$p"
 }
 
+# ---------- 通用: 统一确认提示 (全项目复用) ----------
+# 约定: 直接回车 = 确认(是); 输入 n / no = 拒绝。返回 0=确认 / 1=拒绝
+# 用法: if confirm "是否继续?"; then ... fi   /   confirm "..." || return
+confirm() {
+    local _prompt="$1" _ans
+    read -p "$(echo -e "${_prompt} [${GREEN}回车=是${NC} / ${RED}n=否${NC}]: ")" _ans
+    case "$_ans" in
+        [Nn] | [Nn][Oo]) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 # ---------- 通用: 放行本机防火墙端口 (供任意需要开端口的功能复用) ----------
 # 用法: open_firewall <端口> [协议...]   协议默认 tcp; SS 等可传 "tcp udp"
 # 覆盖 ufw / firewalld / iptables+ip6tables(双栈, -C 幂等, 尽力持久化); 仅 nftables 则提示手动
@@ -252,6 +264,143 @@ open_firewall() {
     else
         echo -e "${YELLOW}  · 未检测到受支持的防火墙工具; 若有防火墙/云安全组请手动放行 ${port} (${plist})${NC}"
     fi
+}
+
+# ---------- 通用: 回收本机防火墙端口 (open_firewall 的逆操作, 供卸载复用) ----------
+# 用法: close_firewall <端口> [协议...]   协议默认 tcp
+close_firewall() {
+    local port="$1"; shift
+    local protos=("$@"); [ ${#protos[@]} -eq 0 ] && protos=("tcp")
+    [ -z "$port" ] && return 0
+    local closed="" proto did=""
+    if command -v ufw >/dev/null 2>&1; then
+        for proto in "${protos[@]}"; do ufw delete allow "${port}/${proto}" >/dev/null 2>&1; done
+        closed="ufw"
+    elif command -v firewall-cmd >/dev/null 2>&1; then
+        for proto in "${protos[@]}"; do firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1; done
+        firewall-cmd --reload >/dev/null 2>&1
+        closed="firewalld"
+    else
+        for proto in "${protos[@]}"; do
+            if command -v iptables >/dev/null 2>&1; then
+                while iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; do
+                    iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || break
+                done
+                did="iptables"
+            fi
+            if command -v ip6tables >/dev/null 2>&1; then
+                while ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; do
+                    ip6tables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || break
+                done
+                did="iptables+ip6tables"
+            fi
+        done
+        if [ -n "$did" ]; then
+            if command -v netfilter-persistent >/dev/null 2>&1; then
+                netfilter-persistent save >/dev/null 2>&1
+            elif [ -d /etc/iptables ] && command -v iptables-save >/dev/null 2>&1; then
+                iptables-save > /etc/iptables/rules.v4 2>/dev/null
+                command -v ip6tables-save >/dev/null 2>&1 && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
+            elif command -v service >/dev/null 2>&1; then
+                service iptables save >/dev/null 2>&1
+            fi
+            closed="$did"
+        fi
+    fi
+    [ -n "$closed" ] && echo -e "${GREEN}  ✓ 已回收防火墙放行: ${port} (${protos[*]}) [${closed}]${NC}"
+    return 0
+}
+
+# ---------- 通用: 系统配置文件的“标记块”精准写入 / 清除 ----------
+# 原则: 系统内置/共享配置文件(如 /etc/sysctl.conf、/etc/security/limits.conf)
+#       不做整文件还原 —— 其它程序可能也修改过同一文件, 整文件覆盖会破坏环境。
+#       本项目写入的内容一律包在标记块内, 卸载/还原时只移除该块, 不动他人配置。
+#
+#   config_block_write  <tag> <文件> <内容>   幂等写入(先删旧块再追加)
+#   config_block_remove <tag> <文件>          仅移除本项目该 tag 的块
+#   config_block_exists <tag> <文件>          是否已存在该块
+#   config_line_remove  <文件> <整行...>      仅删除与给定内容完全一致的行(用于旧版无标记残留)
+
+_cmd_block_begin() { echo "# >>> cmd:${1} >>> 由脚本自动写入, 请勿手改(卸载时整段移除)"; }
+_cmd_block_end()   { echo "# <<< cmd:${1} <<<"; }
+
+config_block_exists() {
+    local tag="$1" file="$2"
+    [ -f "$file" ] || return 1
+    grep -qF "# >>> cmd:${tag} >>>" "$file" 2>/dev/null
+}
+
+config_block_remove() {
+    local tag="$1" file="$2"
+    [ -f "$file" ] || return 0
+    local b="# >>> cmd:${tag} >>>" e="# <<< cmd:${tag} <<<"
+    grep -qF "$b" "$file" 2>/dev/null || return 0
+    local tmp; tmp=$(mktemp) || return 1
+    awk -v b="$b" -v e="$e" '
+        index($0, b) == 1 { skip = 1; next }
+        index($0, e) == 1 { skip = 0; next }
+        skip != 1 { print }
+    ' "$file" > "$tmp" 2>/dev/null && cat "$tmp" > "$file"
+    rm -f "$tmp"
+    echo -e "${GREEN}  ✓ 已移除 ${file} 中本脚本写入的配置段 (其它配置未改动)${NC}"
+}
+
+config_block_write() {
+    local tag="$1" file="$2" content="$3"
+    [ -n "$file" ] || return 1
+    touch "$file" 2>/dev/null || return 1
+    config_block_remove "$tag" "$file" >/dev/null 2>&1   # 幂等: 重复执行不会叠加
+    {
+        _cmd_block_begin "$tag"
+        printf '%s\n' "$content"
+        _cmd_block_end "$tag"
+    } >> "$file"
+    echo -e "${GREEN}  ✓ 已写入 ${file} (标记块 cmd:${tag}, 可安全移除)${NC}"
+}
+
+config_line_remove() {
+    local file="$1"; shift
+    [ -f "$file" ] || return 0
+    local tmp line
+    tmp=$(mktemp) || return 1
+    cp -a "$file" "$tmp" 2>/dev/null
+    for line in "$@"; do
+        grep -vxF "$line" "$tmp" > "${tmp}.n" 2>/dev/null && mv "${tmp}.n" "$tmp"
+    done
+    cat "$tmp" > "$file"
+    rm -f "$tmp" "${tmp}.n"
+}
+
+# ---------- 通用: 备份 (仅用于本项目独占文件, 或同一次操作内的即时回滚) ----------
+# 注意: 共享的系统配置文件请使用上面的 config_block_* / config_line_remove 精准操作,
+#       不要用 restore_file 做长期还原 (会覆盖其它程序在此期间的修改)。
+# 备份目录: /root/.cmd_backups/<tag>/  (保留原始路径结构, 便于还原)
+CMD_BACKUP_ROOT="${CMD_BACKUP_ROOT:-/root/.cmd_backups}"
+
+# backup_file <tag> <文件路径...>  改动前调用; 已存在备份则不覆盖(保留最原始版本)
+backup_file() {
+    local tag="$1"; shift
+    local f dest
+    for f in "$@"; do
+        [ -f "$f" ] || continue
+        dest="${CMD_BACKUP_ROOT}/${tag}${f}"
+        [ -f "$dest" ] && continue
+        mkdir -p "$(dirname "$dest")"
+        cp -a "$f" "$dest" 2>/dev/null && echo -e "${BLUE}  已备份 ${f}${NC}"
+    done
+}
+
+# restore_file <tag> <文件路径...>  卸载/还原时调用, 把备份还原回原位
+restore_file() {
+    local tag="$1"; shift
+    local f src rc=1
+    for f in "$@"; do
+        src="${CMD_BACKUP_ROOT}/${tag}${f}"
+        if [ -f "$src" ]; then
+            cp -a "$src" "$f" 2>/dev/null && { echo -e "${GREEN}  ✓ 已还原 ${f}${NC}"; rc=0; }
+        fi
+    done
+    return $rc
 }
 
 # --- 2. 状态面板 ---

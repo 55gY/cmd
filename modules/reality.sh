@@ -287,14 +287,42 @@ reality_install() {
 # 卸载 Reality (Xray)
 reality_uninstall() {
     check_root
-    echo -e "${yellow}正在卸载 Xray / Reality ...${none}"
-    if [[ -f /usr/local/bin/xray || -f "$REALITY_CONFIG" ]]; then
-        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge 2>/dev/null
-        rm -f "$REALITY_CONFIG" ~/_vless_reality_url_
-        echo -e "${green}Reality (Xray) 卸载完成。${none}"
-    else
+    if [[ ! -f /usr/local/bin/xray && ! -f "$REALITY_CONFIG" ]]; then
         echo -e "${YELLOW}未检测到 Xray 安装。${none}"
+        return 0
     fi
+    confirm "${RED}确定要卸载 Reality (Xray) 并清理其所有文件?${NC}" || {
+        echo -e "${YELLOW}卸载已取消${NC}"; return 0; }
+
+    # 1) 先取出端口(配置删除后就读不到了), 用于回收防火墙放行
+    local old_port; old_port=$(reality_get_port)
+
+    echo -e "${yellow}正在卸载 Xray / Reality ...${none}"
+    # 2) 停止并禁用服务
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop xray >/dev/null 2>&1
+        systemctl disable xray >/dev/null 2>&1
+    else
+        service xray stop >/dev/null 2>&1
+    fi
+
+    # 3) 官方脚本彻底卸载 (含二进制/服务单元/geodata)
+    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge 2>/dev/null
+
+    # 4) 清理本脚本新增的残留文件
+    rm -f "$REALITY_CONFIG" ~/_vless_reality_url_
+    rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray
+    rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service
+    rm -rf /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d
+
+    # 5) 回收安装时放行的防火墙端口
+    [ -n "$old_port" ] && close_firewall "$old_port" tcp
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1
+        systemctl reset-failed xray >/dev/null 2>&1
+    fi
+    echo -e "${green}Reality (Xray) 卸载完成, 相关文件已清理。${none}"
 }
 
 # Reality 管理子菜单

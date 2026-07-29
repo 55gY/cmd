@@ -31,8 +31,7 @@ change_timezone() {
         return
     fi
     
-    read -p "确认将时区修改为 Asia/Shanghai？(y/n): " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    if ! confirm "确认将时区修改为 Asia/Shanghai？"; then
         echo -e "${YELLOW}操作已取消。${NC}"
         return
     fi

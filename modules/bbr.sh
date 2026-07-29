@@ -25,6 +25,35 @@ bbr_status_panel() {
     panel_bot
 }
 
+# 精准还原: 只移除本脚本写入的配置(标记块 + 旧版无标记的同值行), 不动他人配置
+bbr_revert() {
+    check_root
+    panel_top "还原 BBR / 网络优化 配置"
+    echo -e "将${GREEN}只移除本脚本写入的内容${NC}, 文件中其它程序/你自己的配置${GREEN}保持不变${NC}。"
+    panel_bot
+    confirm "确认还原?" || { echo -e "${YELLOW}已取消${NC}"; return 0; }
+
+    # 1) 移除标记块
+    config_block_remove bbr-core   /etc/sysctl.conf
+    config_block_remove bbr-opt    /etc/sysctl.conf
+    config_block_remove bbr-limits /etc/security/limits.conf
+
+    # 2) 兼容旧版本(无标记)残留: 仅删除与本脚本写入值完全一致的行
+    config_line_remove /etc/sysctl.conf \
+        "net.core.default_qdisc = fq" \
+        "net.ipv4.tcp_congestion_control = bbr"
+    config_line_remove /etc/security/limits.conf \
+        "*               soft    nofile          1000000" \
+        "*               hard    nofile          1000000"
+
+    # 3) 本脚本独占创建的文件, 直接删除
+    rm -f /etc/sysctl.d/99-bbr.conf /etc/modules-load.d/bbr.conf
+
+    sysctl --system >/dev/null 2>&1 || sysctl -p >/dev/null 2>&1
+    echo -e "${GREEN}✓ 已还原(移除本脚本写入的 BBR/优化配置)。${NC}"
+    echo -e "${YELLOW}提示: 拥塞控制算法将在重启后回到系统默认; 当前值: ${CYAN}$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)${NC}"
+}
+
 check_bbr_status() {
     local param=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
     if [[ "x${param}" == "xbbr" ]]; then
@@ -96,10 +125,11 @@ check_bbr_os() {
 # 配置 BBR sysctl 参数
 sysctl_config() {
     echo -e "${BLUE}配置 BBR 参数...${NC}"
-    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-    echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
+    # 只写入本项目的标记块(追加在文件末尾, sysctl 后者生效),
+    # 不再全局删除 net.core.default_qdisc / tcp_congestion_control 行 ——
+    # 那些行可能是其它程序或用户自己写的, 删除会破坏环境。
+    config_block_write bbr-core /etc/sysctl.conf "net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr"
     sysctl -p >/dev/null 2>&1
     echo -e "${GREEN}✓ BBR 参数配置完成${NC}"
 }
@@ -261,16 +291,9 @@ install_kernel() {
 add_system_optimization() {
     echo -e "\n${BLUE}开始应用系统网络优化配置...${NC}"
     
-    # 备份原配置
-    if [ -f /etc/sysctl.conf ]; then
-        cp /etc/sysctl.conf /etc/sysctl.conf.bak.$(date +%Y%m%d%H%M%S)
-        echo -e "${GREEN}✓ 已备份 sysctl.conf${NC}"
-    fi
-    
-    # 添加优化参数
-    cat >> /etc/sysctl.conf <<-EOF
-
-# BBR 系统网络优化配置 (添加于 $(date +%Y-%m-%d))
+    # 以标记块方式写入优化参数: 只影响本项目写入的内容, 不动文件里其它程序的配置;
+    # 还原时用 config_block_remove 精准移除该块, 无需(也不应)整文件覆盖。
+    config_block_write bbr-opt /etc/sysctl.conf "# 系统网络优化 (由脚本写入)
 fs.file-max = 1000000
 fs.inotify.max_user_instances = 8192
 
@@ -293,22 +316,14 @@ net.ipv4.tcp_max_orphans = 32768
 kernel.pty.max = 4096
 
 # forward ipv4 (取消注释以启用)
-#net.ipv4.ip_forward = 1
+#net.ipv4.ip_forward = 1"
 
-EOF
-
-    # 配置文件描述符限制
+    # 配置文件描述符限制 (同样使用标记块, 便于精准还原)
     if [ -f /etc/security/limits.conf ]; then
-        if ! grep -q "^\*.*nofile.*1000000" /etc/security/limits.conf; then
-            cat >> /etc/security/limits.conf <<-EOF
-# BBR 优化 - 文件描述符限制
+        config_block_write bbr-limits /etc/security/limits.conf "# 文件描述符限制 (由脚本写入)
 *               soft    nofile          1000000
-*               hard    nofile          1000000
-EOF
-            echo -e "${GREEN}✓ 已配置文件描述符限制${NC}"
-        else
-            echo -e "${YELLOW}文件描述符限制已存在，跳过${NC}"
-        fi
+*               hard    nofile          1000000"
+        echo -e "${GREEN}✓ 已配置文件描述符限制${NC}"
     fi
     
     # 配置 profile
@@ -381,9 +396,8 @@ enable_bbr() {
         echo -e "${GREEN}TCP BBR 已经启用！${NC}"
         echo -e "当前拥塞控制算法: ${YELLOW}$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')${NC}"
         echo -e "当前队列算法: ${YELLOW}$(sysctl net.core.default_qdisc | awk '{print $3}')${NC}"
-        echo -e "\n${YELLOW}是否继续应用系统网络优化配置？(y/n): ${NC}"
-        read -p "请选择: " apply_opt
-        if [[ "$apply_opt" =~ ^[Yy]$ ]]; then
+        echo ""
+        if confirm "是否继续应用系统网络优化配置？"; then
             add_system_optimization
         fi
         return 0
@@ -396,8 +410,7 @@ enable_bbr() {
     if check_kernel_version; then
         echo -e "${GREEN}✓ 内核版本满足要求（≥4.9），可直接启用 BBR${NC}\n"
         
-        read -p "是否立即启用 BBR 并应用系统优化？(y/n): " confirm
-        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        if ! confirm "是否立即启用 BBR 并应用系统优化？"; then
             echo -e "${YELLOW}操作已取消${NC}"
             return 0
         fi
@@ -436,8 +449,7 @@ enable_bbr() {
     echo -e "${YELLOW}虚拟化类型: ${VIRT_TYPE}${NC}"
     echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
     
-    read -p "确认要升级内核并启用 BBR？(yes/no): " confirm_kernel
-    if [[ "$confirm_kernel" != "yes" ]]; then
+    if ! confirm "确认要升级内核并启用 BBR？"; then
         echo -e "${YELLOW}操作已取消${NC}"
         return 0
     fi
@@ -461,8 +473,7 @@ enable_bbr() {
     echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${YELLOW}重启后 BBR 将自动启用${NC}\n"
     
-    read -p "是否立即重启系统？(y/n): " is_reboot
-    if [[ "$is_reboot" =~ ^[Yy]$ ]]; then
+    if confirm "是否立即重启系统？"; then
         echo -e "${GREEN}系统将在 3 秒后重启...${NC}"
         sleep 3
         reboot
@@ -470,4 +481,23 @@ enable_bbr() {
         echo -e "${YELLOW}已取消重启，请稍后手动执行 reboot 命令${NC}"
         echo -e "${YELLOW}重启后执行 sysctl net.ipv4.tcp_congestion_control 验证 BBR 状态${NC}"
     fi
+}
+
+# BBR 网络优化 管理子菜单 (统一样式: 面板 + 选项)
+bbr_menu() {
+    local choice
+    while true; do
+        clear
+        bbr_status_panel
+        echo "1. 启用 BBR / 应用系统网络优化"
+        echo "2. 还原配置 (只移除本脚本写入的内容)"
+        echo "0. 返回主菜单"
+        read -p "请输入选项: " choice
+        case "$choice" in
+            1) enable_bbr; read -n 1 -p "按任意键返回 BBR 菜单..." _ ;;
+            2) bbr_revert; read -n 1 -p "按任意键返回 BBR 菜单..." _ ;;
+            0) break ;;
+            *) echo "无效选项"; sleep 1 ;;
+        esac
+    done
 }

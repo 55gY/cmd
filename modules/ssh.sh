@@ -272,8 +272,7 @@ EOF
 # 成功应用后询问是否启用定时自动回滚 (默认启用)
 ssh_offer_autorollback() {
     echo -e "\n${YELLOW}强烈建议启用“定时自动回滚”防止锁死。${NC}"
-    read -p "启用安全回滚保护? [Y/n]: " _arm
-    if [[ ! "$_arm" =~ ^[Nn]$ ]]; then
+    if confirm "启用安全回滚保护?"; then
         ssh_arm_autorollback 120
     fi
 }
@@ -283,9 +282,151 @@ restart_service() {
     ssh_safe_apply
 }
 
+# ---------- 前置健康检查 / 修复 (改动前先确认 sshd 本身正常) ----------
+# 体检: 问题写入 SSH_HEALTH_ISSUES 数组。返回 0=健康 / 1=有问题
+ssh_health_check() {
+    SSH_HEALTH_ISSUES=()
+    local sshd_bin; sshd_bin="$(command -v sshd || echo /usr/sbin/sshd)"
+
+    # 1) 程序是否存在
+    if [ ! -x "$sshd_bin" ]; then
+        SSH_HEALTH_ISSUES+=("sshd 程序不存在 (可能未安装 openssh-server)")
+    else
+        # 2) 现有配置语法是否已经有错 (与本次改动无关的存量错误)
+        if ! "$sshd_bin" -t 2>/tmp/_sshd_pre.$$; then
+            SSH_HEALTH_ISSUES+=("现有 sshd 配置语法错误: $(head -2 /tmp/_sshd_pre.$$ | tr '\n' ' ')")
+        fi
+        rm -f /tmp/_sshd_pre.$$
+    fi
+
+    # 3) 单元是否被 mask
+    if command -v systemctl >/dev/null 2>&1; then
+        local en_s en_k
+        en_s=$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null)
+        en_k=$(systemctl is-enabled "${SERVICE_NAME}.socket" 2>/dev/null)
+        [ "$en_s" = "masked" ] && SSH_HEALTH_ISSUES+=("${SERVICE_NAME}.service 被 mask (已屏蔽)")
+        [ "$en_k" = "masked" ] && SSH_HEALTH_ISSUES+=("${SERVICE_NAME}.socket 被 mask (已屏蔽)")
+
+        # 4) 运行状态: socket 激活看 socket, 否则看 service
+        if systemctl list-unit-files "${SERVICE_NAME}.socket" >/dev/null 2>&1 \
+            && [ "$en_k" != "masked" ] && [ -n "$en_k" ] && [ "$en_k" != "disabled" ]; then
+            systemctl is-active --quiet "${SERVICE_NAME}.socket" 2>/dev/null \
+                || SSH_HEALTH_ISSUES+=("${SERVICE_NAME}.socket 未运行")
+        else
+            local st; st=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null)
+            case "$st" in
+                active) ;;
+                failed) SSH_HEALTH_ISSUES+=("${SERVICE_NAME}.service 处于 failed 状态") ;;
+                "")     SSH_HEALTH_ISSUES+=("无法查询 ${SERVICE_NAME} 状态 (可能无 systemd)") ;;
+                *)      SSH_HEALTH_ISSUES+=("${SERVICE_NAME}.service 未运行 (${st})") ;;
+            esac
+        fi
+    fi
+
+    # 5) 是否有 SSH 端口在监听
+    if command -v ss >/dev/null 2>&1; then
+        local ports p found=0
+        ports=$(grep "^Port " "$SSH_CONF" 2>/dev/null | awk '{print $2}'); [ -z "$ports" ] && ports=22
+        for p in $ports; do
+            ss -ltn "sport = :${p}" 2>/dev/null | grep -q "LISTEN" && { found=1; break; }
+        done
+        [ "$found" -eq 0 ] && SSH_HEALTH_ISSUES+=("配置端口(${ports//$'\n'/ }) 均未监听")
+    fi
+
+    [ ${#SSH_HEALTH_ISSUES[@]} -eq 0 ]
+}
+
+# 尝试修复常见 sshd 异常 (保守: 不盲改配置)
+ssh_repair() {
+    local sshd_bin; sshd_bin="$(command -v sshd || echo /usr/sbin/sshd)"
+    echo -e "${BLUE}正在尝试修复 SSH 服务...${NC}"
+
+    # a) 未安装 -> 安装 openssh-server
+    if [ ! -x "$sshd_bin" ]; then
+        echo -e "${BLUE}  安装 openssh-server ...${NC}"
+        install_package_if_missing sshd openssh-server
+        sshd_bin="$(command -v sshd || echo /usr/sbin/sshd)"
+    fi
+
+    # b) 解除 mask
+    if command -v systemctl >/dev/null 2>&1; then
+        [ "$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null)" = "masked" ] && {
+            echo -e "${BLUE}  解除 ${SERVICE_NAME}.service 屏蔽 ...${NC}"; systemctl unmask "$SERVICE_NAME" >/dev/null 2>&1; }
+        [ "$(systemctl is-enabled "${SERVICE_NAME}.socket" 2>/dev/null)" = "masked" ] && {
+            echo -e "${BLUE}  解除 ${SERVICE_NAME}.socket 屏蔽 ...${NC}"; systemctl unmask "${SERVICE_NAME}.socket" >/dev/null 2>&1; }
+    fi
+
+    # c) 存量配置语法错误 -> 提供从最近备份恢复 (不擅自改写用户配置)
+    if [ -x "$sshd_bin" ] && ! "$sshd_bin" -t 2>/dev/null; then
+        echo -e "${RED}  现有配置语法错误:${NC}"
+        "$sshd_bin" -t 2>&1 | head -5 | sed 's/^/    /'
+        local newest
+        newest=$(ls -1t /root/.ssh_cmd_backups/ssh_*.tar.gz 2>/dev/null | head -1)
+        if [ -n "$newest" ]; then
+            echo -e "${YELLOW}  发现历史备份: ${newest}${NC}"
+            if confirm "  是否用该备份恢复 sshd 配置?"; then
+                tar xzf "$newest" -C / >/dev/null 2>&1
+                systemctl daemon-reload >/dev/null 2>&1
+                echo -e "${GREEN}  ✓ 已从备份恢复配置${NC}"
+            fi
+        else
+            echo -e "${YELLOW}  无历史备份, 请手动修正 ${SSH_CONF} 后重试。${NC}"
+        fi
+    fi
+
+    # d) 启动/启用服务或 socket
+    if command -v systemctl >/dev/null 2>&1 && [ -x "$sshd_bin" ] && "$sshd_bin" -t 2>/dev/null; then
+        if ssh_is_socket_activated || systemctl list-unit-files "${SERVICE_NAME}.socket" >/dev/null 2>&1; then
+            systemctl enable --now "${SERVICE_NAME}.socket" >/dev/null 2>&1
+        fi
+        systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+        systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || service "$SERVICE_NAME" restart >/dev/null 2>&1
+        systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1
+    fi
+    sleep 1
+}
+
+# 前置守卫: 体检 -> (可选)修复 -> 复检。返回 0=可继续 / 1=中止
+ssh_preflight() {
+    detect_os
+    if ssh_health_check; then
+        echo -e "${GREEN}✓ SSH 服务体检正常, 继续操作。${NC}"
+        return 0
+    fi
+
+    panel_top "SSH 服务体检: 发现异常"
+    local i
+    for i in "${SSH_HEALTH_ISSUES[@]}"; do echo -e "  ${RED}✗${NC} $i"; done
+    panel_bot
+    echo -e "${YELLOW}在 sshd 本身异常时改配置, 失败原因会难以定位, 且可能导致无法登录。${NC}"
+    if ! confirm "是否先尝试自动修复?"; then
+        if confirm "${RED}不修复并继续有风险, 确认继续?${NC}"; then
+            return 0
+        else
+            echo -e "${YELLOW}已取消操作。${NC}"; return 1
+        fi
+    fi
+
+    ssh_repair
+    if ssh_health_check; then
+        echo -e "${GREEN}✓ 修复成功, SSH 服务恢复正常, 继续操作。${NC}"
+        return 0
+    fi
+
+    echo -e "${RED}修复后仍存在问题:${NC}"
+    for i in "${SSH_HEALTH_ISSUES[@]}"; do echo -e "  ${RED}✗${NC} $i"; done
+    if confirm "${RED}仍要继续操作吗?${NC}"; then
+        return 0
+    else
+        echo -e "${YELLOW}已取消操作, 请先修复 SSH 服务。${NC}"; return 1
+    fi
+}
+
 # --- 4. 功能：启用密钥登录 ---
 enable_key_login() {
     echo -e "\n${YELLOW}[操作] 正在配置 Root 密钥登录...${NC}"
+    # 前置: sshd 服务本身异常时先修复, 避免误判与锁死
+    ssh_preflight || return 1
     mkdir -p /root/.ssh && chmod 700 /root/.ssh
 
     # 检查是否存在云平台的root登录限制
@@ -296,9 +437,7 @@ enable_key_login() {
         echo -e "${YELLOW}当前 authorized_keys 包含阻止 root 登录的命令${NC}"
         echo -e "${BLUE}示例: command=\"echo 'Please login...'\"${NC}"
         echo ""
-        read -p "是否清理此限制以允许 root 登录？(y/n): " clean_restriction
-        
-        if [[ "$clean_restriction" =~ ^[Yy]$ ]]; then
+        if confirm "是否清理此限制以允许 root 登录？"; then
             echo -e "${BLUE}正在清理云平台限制...${NC}"
             
             # 备份原文件
@@ -324,8 +463,7 @@ enable_key_login() {
         echo -e "${YELLOW}密钥文件不存在，将生成新密钥对...${NC}"
     else
         echo -e "${BLUE}密钥文件已存在 (包含 $(wc -l < $AUTH_KEYS 2>/dev/null || echo "0") 个密钥)${NC}"
-        read -p "是否添加新的密钥对？(y/n): " add_key
-        [[ "$add_key" =~ ^[Yy]$ ]] && need_new_key=true
+        confirm "是否添加新的密钥对？" && need_new_key=true
     fi
 
     if [ "$need_new_key" = true ]; then
@@ -395,9 +533,7 @@ enable_key_login() {
     else
         echo -e "${YELLOW}建议禁用密码登录以提高安全性${NC}"
         echo -e "${RED}警告: 禁用后只能使用密钥登录，请确保已下载私钥！${NC}"
-        read -p "是否禁用密码登录？(y/n): " dis_pwd
-        
-        if [[ "$dis_pwd" =~ ^[Yy]$ ]]; then
+        if confirm "是否禁用密码登录？"; then
             if [ ! -s "$AUTH_KEYS" ] || ! grep -qE '^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp[0-9]+|ssh-dss|sk-ssh|sk-ecdsa)' "$AUTH_KEYS"; then
                 echo -e "${RED}authorized_keys 中未发现有效公钥, 为避免锁死, 已拒绝禁用密码登录!${NC}"
                 echo -e "${YELLOW}请先确认密钥登录可用, 再来禁用密码。${NC}"
@@ -438,8 +574,10 @@ enable_key_login() {
 change_port() {
     # 确保系统变量已初始化
     detect_os
-    
+
     echo -e "\n${YELLOW}[操作] 修改/新增 SSH 端口...${NC}"
+    # 前置: sshd 服务本身异常时先修复, 避免误判与锁死
+    ssh_preflight || return 1
     read -p "请输入新端口号 (1-65535): " new_port
     [[ ! "$new_port" =~ ^[0-9]+$ ]] && echo "无效输入" && return
     if [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
@@ -510,8 +648,7 @@ change_port() {
     # 监听为“确定未监听”, 或 TCP 自连失败 → 判定端口不可用, 提示回滚
     if [ "$listen_ok" = 0 ] || [ "$tcp_ok" = 0 ]; then
         echo -e "${RED}新端口 ${new_port} 本机自检未通过, 可能无法用它登录!${NC}"
-        read -p "是否立即回滚到原配置? [Y/n]: " _rb
-        if [[ ! "$_rb" =~ ^[Nn]$ ]]; then
+        if confirm "是否立即回滚到原配置?"; then
             ssh_restore
             return 1
         fi
