@@ -26,6 +26,11 @@ ssh_status_panel() {
         echo -e "密钥文件         : ${RED_BOLD}不存在${NC}"
     fi
     echo -e "SSH 服务         : $(svc_status_str "${SERVICE_NAME:-ssh}")"
+    if [ -d /run/sshd ]; then
+        echo -e "运行时目录       : ${GREEN_BOLD}/run/sshd 正常${NC}"
+    else
+        echo -e "运行时目录       : ${RED_BOLD}/run/sshd 缺失 (会导致 sshd -t 失败, 可自动修复)${NC}"
+    fi
     if ssh_is_socket_activated 2>/dev/null; then
         echo -e "激活方式         : ${CYAN}systemd socket (${SERVICE_NAME}.socket)${NC}"
     else
@@ -195,6 +200,80 @@ _ssh_tcp_check() {
 
 # (通用放行函数 open_firewall 已移至 lib/common.sh, 供各功能复用)
 
+# ---------- sshd 运行时环境自愈 ----------
+# 背景: 以下情况会让 `sshd -t` 失败, 但它们都不是配置语法问题, 改配置文件毫无用处:
+#   - Missing privilege separation directory: /run/sshd  (/run 是 tmpfs, 重启即清空)
+#   - Could not load host key: /etc/ssh/ssh_host_*_key   (主机密钥缺失)
+# 因此必须先区分“运行时问题”与“真正的配置错误”, 否则会误判并触发无意义的回滚/恢复。
+
+# 确保 sshd 特权分离目录存在, 并让其在重启后自动创建
+_ssh_ensure_runtime_dir() {
+    local d=/run/sshd
+    if [ ! -d "$d" ]; then
+        mkdir -p "$d" 2>/dev/null
+        chmod 0755 "$d" 2>/dev/null
+        chown root:root "$d" 2>/dev/null
+        if [ -d "$d" ]; then
+            echo -e "${GREEN}  ✓ 已创建缺失的运行时目录 ${d}${NC}"
+        else
+            echo -e "${RED}  ✗ 无法创建 ${d} (权限不足?)${NC}"
+            return 1
+        fi
+    fi
+    # /run 为 tmpfs, 重启会清空; 用 tmpfiles.d 规则保证开机自动重建
+    if [ -d /etc/tmpfiles.d ] && [ ! -f /etc/tmpfiles.d/cmd-sshd-runtime.conf ]; then
+        if echo 'd /run/sshd 0755 root root -' > /etc/tmpfiles.d/cmd-sshd-runtime.conf 2>/dev/null; then
+            echo -e "${GREEN}  ✓ 已添加 tmpfiles 规则, 重启后自动重建 ${d}${NC}"
+        fi
+    fi
+    return 0
+}
+
+# 针对 sshd -t 输出里的运行时问题做自动修复; 修复了任意一项返回 0
+_ssh_fix_runtime_issue() {
+    local out="$1" fixed=1
+    if echo "$out" | grep -qi 'privilege separation directory'; then
+        echo -e "${BLUE}  检测到运行时目录缺失(非配置错误), 正在修复...${NC}"
+        _ssh_ensure_runtime_dir && fixed=0
+    fi
+    if echo "$out" | grep -qi 'Could not load host key'; then
+        echo -e "${BLUE}  检测到主机密钥缺失(非配置错误), 正在生成 (ssh-keygen -A)...${NC}"
+        if ssh-keygen -A >/dev/null 2>&1; then
+            echo -e "${GREEN}  ✓ 已生成缺失的主机密钥${NC}"
+            fixed=0
+        fi
+    fi
+    return $fixed
+}
+
+# 校验 sshd 配置并分类; 对运行时问题会先自愈再复检
+# 返回: 0=通过  1=真正的配置错误  2=运行时问题且自愈失败
+# 输出留在 SSH_SSHDT_OUT
+_ssh_config_test() {
+    local sshd_bin out rc
+    sshd_bin="$(command -v sshd || echo /usr/sbin/sshd)"
+    if [ ! -x "$sshd_bin" ]; then
+        SSH_SSHDT_OUT="sshd 程序不存在"
+        return 1
+    fi
+    out=$("$sshd_bin" -t 2>&1); rc=$?
+    SSH_SSHDT_OUT="$out"
+    [ $rc -eq 0 ] && return 0
+
+    # 属于可自愈的运行时问题 -> 修复后复检
+    if echo "$out" | grep -qiE 'privilege separation directory|Could not load host key'; then
+        if _ssh_fix_runtime_issue "$out"; then
+            out=$("$sshd_bin" -t 2>&1); rc=$?
+            SSH_SSHDT_OUT="$out"
+            [ $rc -eq 0 ] && { echo -e "${GREEN}  ✓ 运行时问题已修复, 配置校验通过${NC}"; return 0; }
+            echo "$out" | grep -qiE 'privilege separation directory|Could not load host key' && return 2
+            return 1
+        fi
+        return 2
+    fi
+    return 1
+}
+
 # 从最近一次备份回滚 (清除新增 socket drop-in, 按激活方式重启)
 ssh_restore() {
     if [ -z "$SSH_LAST_BACKUP" ] || [ ! -f "$SSH_LAST_BACKUP" ]; then
@@ -209,16 +288,15 @@ ssh_restore() {
 
 # 校验(sshd -t) → 按激活方式重启 → 验证可服务; 任一失败则自动回滚。返回 0/1
 ssh_safe_apply() {
-    local sshd_bin; sshd_bin="$(command -v sshd || echo /usr/sbin/sshd)"
     echo -e "${BLUE}正在校验 SSH 配置 (sshd -t)...${NC}"
-    if ! "$sshd_bin" -t 2>/tmp/_sshd_test.$$; then
-        echo -e "${RED}配置语法校验失败:${NC}"
-        cat /tmp/_sshd_test.$$ 2>/dev/null
-        rm -f /tmp/_sshd_test.$$
+    # 先确保运行时目录存在, 避免 /run/sshd 缺失导致的假失败
+    _ssh_ensure_runtime_dir >/dev/null 2>&1
+    if ! _ssh_config_test; then
+        echo -e "${RED}配置校验失败:${NC}"
+        echo "$SSH_SSHDT_OUT" | head -5 | sed 's/^/  /'
         ssh_restore
         return 1
     fi
-    rm -f /tmp/_sshd_test.$$
     if ssh_is_socket_activated; then
         echo -e "${BLUE}检测到 systemd socket 激活 (${SERVICE_NAME}.socket): 端口由 socket 控制, 正在重启 socket 使其生效...${NC}"
     fi
@@ -292,11 +370,13 @@ ssh_health_check() {
     if [ ! -x "$sshd_bin" ]; then
         SSH_HEALTH_ISSUES+=("sshd 程序不存在 (可能未安装 openssh-server)")
     else
-        # 2) 现有配置语法是否已经有错 (与本次改动无关的存量错误)
-        if ! "$sshd_bin" -t 2>/tmp/_sshd_pre.$$; then
-            SSH_HEALTH_ISSUES+=("现有 sshd 配置语法错误: $(head -2 /tmp/_sshd_pre.$$ | tr '\n' ' ')")
-        fi
-        rm -f /tmp/_sshd_pre.$$
+        # 2) 校验现有配置 (自动区分“运行时问题”与真正的配置语法错误, 并尝试自愈)
+        _ssh_config_test
+        case $? in
+            0) ;;
+            2) SSH_HEALTH_ISSUES+=("sshd 运行时环境异常且自动修复失败: $(echo "$SSH_SSHDT_OUT" | head -1)") ;;
+            *) SSH_HEALTH_ISSUES+=("现有 sshd 配置语法错误: $(echo "$SSH_SSHDT_OUT" | head -1)") ;;
+        esac
     fi
 
     # 3) 单元是否被 mask
@@ -356,26 +436,32 @@ ssh_repair() {
             echo -e "${BLUE}  解除 ${SERVICE_NAME}.socket 屏蔽 ...${NC}"; systemctl unmask "${SERVICE_NAME}.socket" >/dev/null 2>&1; }
     fi
 
-    # c) 存量配置语法错误 -> 提供从最近备份恢复 (不擅自改写用户配置)
-    if [ -x "$sshd_bin" ] && ! "$sshd_bin" -t 2>/dev/null; then
-        echo -e "${RED}  现有配置语法错误:${NC}"
-        "$sshd_bin" -t 2>&1 | head -5 | sed 's/^/    /'
-        local newest
-        newest=$(ls -1t /root/.ssh_cmd_backups/ssh_*.tar.gz 2>/dev/null | head -1)
-        if [ -n "$newest" ]; then
-            echo -e "${YELLOW}  发现历史备份: ${newest}${NC}"
-            if confirm "  是否用该备份恢复 sshd 配置?"; then
-                tar xzf "$newest" -C / >/dev/null 2>&1
-                systemctl daemon-reload >/dev/null 2>&1
-                echo -e "${GREEN}  ✓ 已从备份恢复配置${NC}"
+    # c) 修运行时问题: /run/sshd 缺失、主机密钥缺失 —— 这些都不是配置错误
+    _ssh_ensure_runtime_dir
+
+    # d) 复检: 只有确认是“真正的配置语法错误”才提供从备份恢复 (不擅自改写用户配置)
+    if [ -x "$sshd_bin" ]; then
+        _ssh_config_test
+        if [ $? -eq 1 ]; then
+            echo -e "${RED}  现有配置语法错误:${NC}"
+            echo "$SSH_SSHDT_OUT" | head -5 | sed 's/^/    /'
+            local newest
+            newest=$(ls -1t /root/.ssh_cmd_backups/ssh_*.tar.gz 2>/dev/null | head -1)
+            if [ -n "$newest" ]; then
+                echo -e "${YELLOW}  发现历史备份: ${newest}${NC}"
+                if confirm "  是否用该备份恢复 sshd 配置?"; then
+                    tar xzf "$newest" -C / >/dev/null 2>&1
+                    systemctl daemon-reload >/dev/null 2>&1
+                    echo -e "${GREEN}  ✓ 已从备份恢复配置${NC}"
+                fi
+            else
+                echo -e "${YELLOW}  无历史备份, 请手动修正 ${SSH_CONF} 后重试。${NC}"
             fi
-        else
-            echo -e "${YELLOW}  无历史备份, 请手动修正 ${SSH_CONF} 后重试。${NC}"
         fi
     fi
 
-    # d) 启动/启用服务或 socket
-    if command -v systemctl >/dev/null 2>&1 && [ -x "$sshd_bin" ] && "$sshd_bin" -t 2>/dev/null; then
+    # e) 启动/启用服务或 socket
+    if command -v systemctl >/dev/null 2>&1 && [ -x "$sshd_bin" ] && _ssh_config_test >/dev/null 2>&1; then
         if ssh_is_socket_activated || systemctl list-unit-files "${SERVICE_NAME}.socket" >/dev/null 2>&1; then
             systemctl enable --now "${SERVICE_NAME}.socket" >/dev/null 2>&1
         fi

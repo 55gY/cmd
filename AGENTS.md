@@ -63,6 +63,10 @@ modules/*.sh      各功能实现,按需加载(.sh 后缀)
 ## 5. SSH 安全(密钥登录 / 端口)—— 防锁死(关键)
 
 - **改动前先体检 sshd 本身**:`enable_key_login` / `change_port` 入口一律先 `ssh_preflight || return 1`。`ssh_health_check` 检查五项(sshd 程序是否存在、**现有配置 `sshd -t` 是否已有存量错误**、unit 是否被 mask、服务/socket 是否在运行、配置端口是否有监听);有异常则展示面板并默认尝试 `ssh_repair`(装 openssh-server、`unmask`、必要时从 `/root/.ssh_cmd_backups` 最近备份恢复、`enable --now` socket/service、`reset-failed`),复检仍失败则需用户明确确认才继续。目的:**避免把"本来就坏"的 sshd 误判成本次改动失败并触发无意义回滚**。修复保守,不擅自改写用户配置。
+- **必须区分「运行时问题」与「真正的配置语法错误」**:`sshd -t` 失败并不等于配置写错。以下属运行时问题,改配置文件无用,须自动修复:
+  - `Missing privilege separation directory: /run/sshd` → `/run` 是 tmpfs,重启即清空;用 `_ssh_ensure_runtime_dir` 创建(0755 root:root)并写 `/etc/tmpfiles.d/cmd-sshd-runtime.conf` 保证重启后自动重建。
+  - `Could not load host key: /etc/ssh/ssh_host_*_key` → 用 `ssh-keygen -A` 生成。
+  统一走 `_ssh_config_test`:自动识别上述情况 → 自愈 → 复检,返回 `0=通过 / 1=真配置错误 / 2=运行时问题且修复失败`。**严禁**把运行时问题当配置错误去"从备份恢复配置"(无效,且可能用旧配置覆盖好配置)。`ssh_safe_apply` 校验前先 `_ssh_ensure_runtime_dir`,避免假失败触发无意义回滚。SSH 面板显示「运行时目录」状态。
 - 任何 sshd 配置改动**改前必须 `ssh_backup`**(备份 sshd_config + `sshd_config.d` + socket override 到时间戳压缩包)。
 - 应用一律走 `ssh_safe_apply`:`sshd -t` 校验 → 重启 → 验证服务 `is-active`;**任一失败自动 `ssh_restore` 回滚**,绝不 `exit` 整个脚本。
 - 改端口:默认 [A]追加保留 22;重启前先调 common 的 **`open_firewall <端口> tcp`** 放行本机防火墙(**ufw / firewalld / iptables+ip6tables 双栈**,`-C` 幂等去重,尽力持久化 netfilter-persistent / rules.v4·v6 / `service iptables save`;仅 nftables 无 ufw·firewalld 时提示手动放行);SELinux 用 `semanage port -a || -m`;重启后做两项自检——**新端口在监听**(`ss`)+ **本机 TCP 自连测试**(`_ssh_tcp_check`,优先 `bash /dev/tcp` 回退 `nc`),任一失败即提示回滚;强提示云服务器仍需在安全组另行放行(本机放行/自连不代表外网可达)。
