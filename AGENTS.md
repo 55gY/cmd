@@ -72,6 +72,9 @@ modules/*.sh      各功能实现,按需加载(.sh 后缀)
 - 改端口:默认 [A]追加保留 22;重启前先调 common 的 **`open_firewall <端口> tcp`** 放行本机防火墙(**ufw / firewalld / iptables+ip6tables 双栈**,`-C` 幂等去重,尽力持久化 netfilter-persistent / rules.v4·v6 / `service iptables save`;仅 nftables 无 ufw·firewalld 时提示手动放行);SELinux 用 `semanage port -a || -m`;重启后做两项自检——**新端口在监听**(`ss`)+ **本机 TCP 自连测试**(`_ssh_tcp_check`,优先 `bash /dev/tcp` 回退 `nc`),任一失败即提示回滚;强提示云服务器仍需在安全组另行放行(本机放行/自连不代表外网可达)。
 - **禁用密码登录前必须确认 `authorized_keys` 含有效公钥**,否则拒绝禁用。
 - 提供**定时自动回滚** `ssh_arm_autorollback`(默认 120s,`setsid` 脱离会话):另开会话确认可登录后 `touch <keep 文件>` 取消,否则到时自动恢复原配置。sshd 重启不会中断现有会话,故可安全测试。
+- **写 socket 端口覆盖时必须去重(踩过的坑)**:`systemctl show -p Listen ssh.socket` 会把同一端口的 IPv4 与 IPv6 各列一条,直接采集会得到重复端口,写出两条 `ListenStream=22` → systemd 重复绑定同一端口 → `Address already in use` → `ssh.socket` failed → `ssh.service` 依赖失败 → **SSH 整体不可用**。`configure_ssh_socket_ports` 写入前必须去重;`_ssh_fix_socket_override` 可修复已损坏的机器(去重重写 + `daemon-reload` + `reset-failed`),并在 `ssh_repair` 早期调用;若仍失败则提议 `systemctl revert ssh.socket` 回到默认端口以先恢复 SSH。
+- **判定 SSH 是否正常时,socket 与 service 任一 `active` 即算正常**(不可二选一,否则 socket 为 static/indirect 而实际跑 service 的机器会被误报);端口用 `_ssh_effective_ports`(`sshd -T` 解析 Include/Match + socket `ListenStream` + 兜底 22),不要只 `grep "^Port "`。
+- **修复失败必须输出真实原因**:`ssh_show_diagnostics` 打印两个单元的 enabled/active、`systemctl status` 尾部、`journalctl -u ssh` 与 `-u ssh.socket`、生效端口、`ss -ltnp`。禁止把错误 `>/dev/null 2>&1` 吞掉后只说“仍有问题”。
 - **兼容 systemd socket 激活(Ubuntu 22.10+/24.04 的 `ssh.socket`)**:此时端口由 socket 的 `ListenStream` 控制,**只改 `sshd_config` 并重启 `ssh` 服务无效**。`configure_ssh_socket_ports` 写 socket 的 `ListenStream` override;`ssh_safe_apply` 经 `ssh_is_socket_activated` 判定后重启 **`ssh.socket`**(而非 `ssh.service`),并以 socket 是否 `active` 作为存活判据——socket 模式下 `ssh.service` 常态 `inactive` 属正常,**不得据此误判失败而回滚**。状态面板显示“激活方式: systemd socket / 传统 service”。
 
 ## 6. 卸载与还原(必须彻底)

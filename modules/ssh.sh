@@ -128,6 +128,17 @@ configure_ssh_socket_ports() {
         final_ports=("$new_port")
     fi
 
+    # 【关键】端口去重: systemctl show -p Listen 会把同一端口的 IPv4/IPv6 各列一次,
+    # 若不去重就会写出重复的 ListenStream, systemd 重复绑定同一端口 →
+    # "Address already in use" → socket 启动失败 → ssh.service 依赖失败 → SSH 整体不可用。
+    local uniq_ports=() q seen
+    for p in "${final_ports[@]}"; do
+        seen=0
+        for q in "${uniq_ports[@]}"; do [ "$q" = "$p" ] && { seen=1; break; }; done
+        [ "$seen" -eq 0 ] && uniq_ports+=("$p")
+    done
+    final_ports=("${uniq_ports[@]}")
+
     # 写入配置
     mkdir -p "$dropin_dir"
     {
@@ -274,6 +285,78 @@ _ssh_config_test() {
     return 1
 }
 
+# ---------- 准确判定“SSH 到底通不通” (避免误报) ----------
+# 当前实际生效的方式: socket / service / none
+# 关键: socket 与 service 只要任一 active 即视为正常 —— 不能只看其中一个,
+#       否则 socket 单元为 static/indirect 而实际跑 service 的机器会被误报。
+_ssh_active_mode() {
+    command -v systemctl >/dev/null 2>&1 || { echo none; return; }
+    if systemctl is-active --quiet "${SERVICE_NAME}.socket" 2>/dev/null; then echo socket; return; fi
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then echo service; return; fi
+    echo none
+}
+
+# 取“真正生效”的 SSH 端口: 优先 sshd -T(会解析 Include/Match),
+# 再叠加 socket 单元的 ListenStream(Ubuntu 22.10+/24.04 端口在此), 最后兜底 22
+_ssh_effective_ports() {
+    local ports="" sshd_bin p item
+    sshd_bin="$(command -v sshd || echo /usr/sbin/sshd)"
+    if [ -x "$sshd_bin" ]; then
+        ports=$("$sshd_bin" -T 2>/dev/null | awk '/^port /{print $2}')
+    fi
+    if [ -z "$ports" ]; then
+        ports=$(grep -hE '^[[:space:]]*Port[[:space:]]+[0-9]+' "$SSH_CONF" /etc/ssh/sshd_config.d/*.conf 2>/dev/null | awk '{print $2}')
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        for item in $(systemctl show -p Listen "${SERVICE_NAME}.socket" 2>/dev/null | sed 's/^Listen=//'); do
+            p=$(echo "$item" | sed 's/.*://')
+            [[ "$p" =~ ^[0-9]+$ ]] && ports="${ports} ${p}"
+        done
+    fi
+    [ -z "${ports// /}" ] && ports=22
+    echo "$ports" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u | tr '\n' ' '
+}
+
+# SSH 是否确实在监听。0=在监听/无法判定, 1=确认没有监听
+_ssh_listening_ok() {
+    # socket 处于 active 时, 监听套接字由 systemd 持有, 按定义即可接受连接
+    [ "$(_ssh_active_mode)" = "socket" ] && return 0
+    command -v ss >/dev/null 2>&1 || return 0   # 无 ss, 不做判定(不误报)
+    local p
+    for p in $(_ssh_effective_ports); do
+        ss -ltn "sport = :${p}" 2>/dev/null | grep -q "LISTEN" && return 0
+    done
+    # 兜底: 存在由 sshd 持有的监听套接字(端口可能来自本函数未覆盖的来源)
+    ss -ltnp 2>/dev/null | grep -q 'sshd' && return 0
+    return 1
+}
+
+# 修正 socket override 中重复的 ListenStream (重复绑定会导致 Address already in use)
+# 返回 0=发现并已修正 / 1=无需修正或无法修正
+_ssh_fix_socket_override() {
+    local f="/etc/systemd/system/${SERVICE_NAME}.socket.d/override.conf"
+    [ -f "$f" ] || return 1
+    local ports p q seen uniq=() n_all n_uniq
+    ports=$(grep -E '^[[:space:]]*ListenStream=[0-9]+' "$f" 2>/dev/null | sed 's/.*ListenStream=//')
+    [ -z "$ports" ] && return 1
+    for p in $ports; do
+        seen=0
+        for q in "${uniq[@]}"; do [ "$q" = "$p" ] && { seen=1; break; }; done
+        [ "$seen" -eq 0 ] && uniq+=("$p")
+    done
+    n_all=$(echo "$ports" | wc -w | tr -d ' '); n_uniq=${#uniq[@]}
+    [ "$n_all" -eq "$n_uniq" ] && return 1     # 没有重复
+    {
+        echo "[Socket]"
+        echo "ListenStream="
+        for p in "${uniq[@]}"; do echo "ListenStream=${p}"; done
+    } > "$f"
+    systemctl daemon-reload >/dev/null 2>&1
+    systemctl reset-failed "${SERVICE_NAME}.socket" "$SERVICE_NAME" >/dev/null 2>&1
+    echo -e "${GREEN}  ✓ 已修正 ${SERVICE_NAME}.socket 中重复的监听端口 (${n_all} 项 → ${n_uniq} 项: ${uniq[*]})${NC}"
+    return 0
+}
+
 # 从最近一次备份回滚 (清除新增 socket drop-in, 按激活方式重启)
 ssh_restore() {
     if [ -z "$SSH_LAST_BACKUP" ] || [ ! -f "$SSH_LAST_BACKUP" ]; then
@@ -387,30 +470,34 @@ ssh_health_check() {
         [ "$en_s" = "masked" ] && SSH_HEALTH_ISSUES+=("${SERVICE_NAME}.service 被 mask (已屏蔽)")
         [ "$en_k" = "masked" ] && SSH_HEALTH_ISSUES+=("${SERVICE_NAME}.socket 被 mask (已屏蔽)")
 
-        # 4) 运行状态: socket 激活看 socket, 否则看 service
-        if systemctl list-unit-files "${SERVICE_NAME}.socket" >/dev/null 2>&1 \
-            && [ "$en_k" != "masked" ] && [ -n "$en_k" ] && [ "$en_k" != "disabled" ]; then
-            systemctl is-active --quiet "${SERVICE_NAME}.socket" 2>/dev/null \
-                || SSH_HEALTH_ISSUES+=("${SERVICE_NAME}.socket 未运行")
-        else
+        # 3.5) socket 处于 failed: 明确指出常见根因(override 端口重复导致重复绑定)
+        if [ "$(systemctl is-failed "${SERVICE_NAME}.socket" 2>/dev/null)" = "failed" ]; then
+            local dup_hint=""
+            local ovf="/etc/systemd/system/${SERVICE_NAME}.socket.d/override.conf"
+            if [ -f "$ovf" ]; then
+                local _all _uni
+                _all=$(grep -cE '^[[:space:]]*ListenStream=[0-9]+' "$ovf" 2>/dev/null)
+                _uni=$(grep -E '^[[:space:]]*ListenStream=[0-9]+' "$ovf" 2>/dev/null | sed 's/.*=//' | sort -u | wc -l)
+                [ "${_all:-0}" -gt "${_uni:-0}" ] && dup_hint=" —— override 中存在重复端口, 会重复绑定同一端口(可自动修复)"
+            fi
+            SSH_HEALTH_ISSUES+=("${SERVICE_NAME}.socket 启动失败 (failed)${dup_hint}")
+        fi
+
+        # 4) 运行状态: socket 与 service 任一 active 即正常 (不再二选一误判)
+        local mode; mode=$(_ssh_active_mode)
+        if [ "$mode" = "none" ]; then
             local st; st=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null)
             case "$st" in
-                active) ;;
                 failed) SSH_HEALTH_ISSUES+=("${SERVICE_NAME}.service 处于 failed 状态") ;;
                 "")     SSH_HEALTH_ISSUES+=("无法查询 ${SERVICE_NAME} 状态 (可能无 systemd)") ;;
-                *)      SSH_HEALTH_ISSUES+=("${SERVICE_NAME}.service 未运行 (${st})") ;;
+                *)      SSH_HEALTH_ISSUES+=("SSH 未运行 (${SERVICE_NAME}.service=${st}, ${SERVICE_NAME}.socket 亦未激活)") ;;
             esac
         fi
     fi
 
-    # 5) 是否有 SSH 端口在监听
-    if command -v ss >/dev/null 2>&1; then
-        local ports p found=0
-        ports=$(grep "^Port " "$SSH_CONF" 2>/dev/null | awk '{print $2}'); [ -z "$ports" ] && ports=22
-        for p in $ports; do
-            ss -ltn "sport = :${p}" 2>/dev/null | grep -q "LISTEN" && { found=1; break; }
-        done
-        [ "$found" -eq 0 ] && SSH_HEALTH_ISSUES+=("配置端口(${ports//$'\n'/ }) 均未监听")
+    # 5) 是否确实在监听 (按生效端口判定; socket 激活时由 systemd 持有监听)
+    if ! _ssh_listening_ok; then
+        SSH_HEALTH_ISSUES+=("生效端口($(_ssh_effective_ports)) 均未监听")
     fi
 
     [ ${#SSH_HEALTH_ISSUES[@]} -eq 0 ]
@@ -436,6 +523,9 @@ ssh_repair() {
             echo -e "${BLUE}  解除 ${SERVICE_NAME}.socket 屏蔽 ...${NC}"; systemctl unmask "${SERVICE_NAME}.socket" >/dev/null 2>&1; }
     fi
 
+    # b2) socket override 端口重复 -> 重复绑定 -> socket 失败 -> SSH 全挂; 先修这个
+    _ssh_fix_socket_override
+
     # c) 修运行时问题: /run/sshd 缺失、主机密钥缺失 —— 这些都不是配置错误
     _ssh_ensure_runtime_dir
 
@@ -460,16 +550,73 @@ ssh_repair() {
         fi
     fi
 
-    # e) 启动/启用服务或 socket
+    # e) 启动 SSH: 只操作系统当前实际采用的方式, 绝不同时拉起 socket 和 service
+    #    (两者都监听同一端口会互相冲突, 反而可能把本来正常的环境弄坏)
     if command -v systemctl >/dev/null 2>&1 && [ -x "$sshd_bin" ] && _ssh_config_test >/dev/null 2>&1; then
-        if ssh_is_socket_activated || systemctl list-unit-files "${SERVICE_NAME}.socket" >/dev/null 2>&1; then
-            systemctl enable --now "${SERVICE_NAME}.socket" >/dev/null 2>&1
+        local mode; mode=$(_ssh_active_mode)
+        if [ "$mode" = "socket" ]; then
+            echo -e "${BLUE}  当前为 socket 激活模式, 重启 ${SERVICE_NAME}.socket ...${NC}"
+            systemctl restart "${SERVICE_NAME}.socket" >/dev/null 2>&1
+        elif [ "$mode" = "service" ]; then
+            echo -e "${BLUE}  当前为传统 service 模式, 重启 ${SERVICE_NAME} ...${NC}"
+            systemctl restart "$SERVICE_NAME" >/dev/null 2>&1
+        else
+            # 两者都没起: 按发行版默认方式拉起 —— socket 单元已 enabled 才用 socket, 否则用 service
+            local en_k; en_k=$(systemctl is-enabled "${SERVICE_NAME}.socket" 2>/dev/null)
+            if [ "$en_k" = "enabled" ]; then
+                echo -e "${BLUE}  ${SERVICE_NAME}.socket 已启用但未运行, 正在启动 ...${NC}"
+                systemctl start "${SERVICE_NAME}.socket" >/dev/null 2>&1
+            else
+                echo -e "${BLUE}  正在启用并启动 ${SERVICE_NAME} ...${NC}"
+                systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+                systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || service "$SERVICE_NAME" restart >/dev/null 2>&1
+            fi
         fi
-        systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
-        systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || service "$SERVICE_NAME" restart >/dev/null 2>&1
         systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1
+
+        # f) 兜底: 若 socket 仍处于 failed, 提议丢弃本脚本写的 override 回到系统默认端口
+        sleep 1
+        if [ "$(systemctl is-failed "${SERVICE_NAME}.socket" 2>/dev/null)" = "failed" ] \
+            && [ -f "/etc/systemd/system/${SERVICE_NAME}.socket.d/override.conf" ]; then
+            echo -e "${RED}  ${SERVICE_NAME}.socket 仍然启动失败。${NC}"
+            echo -e "${YELLOW}  可丢弃本脚本写入的端口覆盖(systemctl revert), 回到系统默认端口以先恢复 SSH。${NC}"
+            if confirm "  是否丢弃端口覆盖并恢复默认?"; then
+                systemctl revert "${SERVICE_NAME}.socket" >/dev/null 2>&1
+                systemctl daemon-reload >/dev/null 2>&1
+                systemctl reset-failed "${SERVICE_NAME}.socket" "$SERVICE_NAME" >/dev/null 2>&1
+                systemctl start "${SERVICE_NAME}.socket" >/dev/null 2>&1
+                if systemctl is-active --quiet "${SERVICE_NAME}.socket" 2>/dev/null; then
+                    echo -e "${GREEN}  ✓ 已恢复默认端口, ${SERVICE_NAME}.socket 已启动${NC}"
+                fi
+            fi
+        fi
     fi
     sleep 1
+}
+
+# 故障诊断: 修复失败时输出真实原因(单元状态 + 日志 + 监听情况), 而不是只说“仍有问题”
+ssh_show_diagnostics() {
+    panel_top "SSH 故障诊断"
+    if command -v systemctl >/dev/null 2>&1; then
+        echo -e "${YELLOW}单元状态:${NC}"
+        printf '  %-16s enabled=%-10s active=%s\n' "${SERVICE_NAME}.service" \
+            "$(systemctl is-enabled "$SERVICE_NAME" 2>&1 | head -1)" "$(systemctl is-active "$SERVICE_NAME" 2>&1 | head -1)"
+        printf '  %-16s enabled=%-10s active=%s\n' "${SERVICE_NAME}.socket" \
+            "$(systemctl is-enabled "${SERVICE_NAME}.socket" 2>&1 | head -1)" "$(systemctl is-active "${SERVICE_NAME}.socket" 2>&1 | head -1)"
+        echo -e "${YELLOW}启动失败原因 (systemctl status):${NC}"
+        systemctl status "$SERVICE_NAME" --no-pager -l 2>/dev/null | tail -12 | sed 's/^/  /'
+        if command -v journalctl >/dev/null 2>&1; then
+            echo -e "${YELLOW}最近日志 (${SERVICE_NAME}):${NC}"
+            journalctl -u "$SERVICE_NAME" --no-pager -n 15 2>/dev/null | tail -15 | sed 's/^/  /'
+            echo -e "${YELLOW}最近日志 (${SERVICE_NAME}.socket):${NC}"
+            journalctl -u "${SERVICE_NAME}.socket" --no-pager -n 8 2>/dev/null | tail -8 | sed 's/^/  /'
+        fi
+    fi
+    echo -e "${YELLOW}生效端口:${NC} $(_ssh_effective_ports)"
+    echo -e "${YELLOW}当前 TCP 监听:${NC}"
+    ss -ltnp 2>/dev/null | head -12 | sed 's/^/  /'
+    panel_bot
+    echo -e "${YELLOW}可手动尝试: ${GREEN}systemctl start ${SERVICE_NAME}.socket${YELLOW} 或 ${GREEN}systemctl start ${SERVICE_NAME}${NC}"
 }
 
 # 前置守卫: 体检 -> (可选)修复 -> 复检。返回 0=可继续 / 1=中止
@@ -501,6 +648,8 @@ ssh_preflight() {
 
     echo -e "${RED}修复后仍存在问题:${NC}"
     for i in "${SSH_HEALTH_ISSUES[@]}"; do echo -e "  ${RED}✗${NC} $i"; done
+    # 输出真实原因, 便于定位(而不是只说“仍有问题”)
+    ssh_show_diagnostics
     if confirm "${RED}仍要继续操作吗?${NC}"; then
         return 0
     else
