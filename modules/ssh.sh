@@ -7,7 +7,6 @@ ssh_status_panel() {
     local root_login pwd_auth ports
     root_login=$(grep "^PermitRootLogin" "$SSH_CONF" 2>/dev/null | awk '{print $2}'); [ -z "$root_login" ] && root_login="默认(prohibit-password)"
     pwd_auth=$(grep "^PasswordAuthentication" "$SSH_CONF" 2>/dev/null | awk '{print $2}'); [ -z "$pwd_auth" ] && pwd_auth="yes(默认)"
-    ports=$(grep "^Port " "$SSH_CONF" 2>/dev/null | awk '{print $2}' | xargs); [ -z "$ports" ] && ports="22(默认)"
     panel_top "SSH 状态检测"
     if [[ "$root_login" =~ ^(yes|YES)$ ]]; then
         echo -e "Root 登录        : ${GREEN_BOLD}${root_login}${NC}"
@@ -19,7 +18,29 @@ ssh_status_panel() {
     else
         echo -e "密码验证         : ${RED_BOLD}${pwd_auth}${NC}"
     fi
-    echo -e "SSH 端口         : ${CYAN}${ports}${NC}"
+    # 端口: 以“是否真的在监听”为准, 逐个标注; 避免拿 sshd_config 的 Port 当真相
+    local p portline="" eff
+    eff=$(_ssh_effective_ports)
+    for p in $eff; do
+        if command -v ss >/dev/null 2>&1 && ss -ltn "sport = :${p}" 2>/dev/null | grep -q "LISTEN"; then
+            portline="${portline}${GREEN_BOLD}${p}(监听中)${NC} "
+        else
+            portline="${portline}${RED_BOLD}${p}(未监听)${NC} "
+        fi
+    done
+    echo -e "SSH 端口         : ${portline:-${CYAN}未知${NC}}"
+    # socket 激活时: 端口由 socket 决定, sshd_config 的 Port 会被忽略 —— 明确提示差异
+    if ssh_is_socket_activated 2>/dev/null; then
+        local sp cp
+        sp=$(_ssh_socket_ports); cp=$(_ssh_config_ports)
+        echo -e "  ├ socket 端口   : ${CYAN}${sp:-无}${NC} ${YELLOW}(实际生效)${NC}"
+        echo -e "  └ sshd_config   : ${CYAN}${cp:-无}${NC} ${YELLOW}(socket 模式下被忽略)${NC}"
+        local x miss=""
+        for x in $cp; do
+            case " $sp " in *" $x "*) ;; *) miss="${miss}${x} ";; esac
+        done
+        [ -n "$miss" ] && echo -e "  ${RED}⚠ 端口 ${miss}只写在 sshd_config, 未加入 socket, 因此不会生效${NC}"
+    fi
     if [ -f "$AUTH_KEYS" ]; then
         echo -e "密钥文件         : ${GREEN_BOLD}已存在${NC}"
     else
@@ -315,6 +336,23 @@ _ssh_effective_ports() {
     fi
     [ -z "${ports// /}" ] && ports=22
     echo "$ports" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u | tr '\n' ' '
+}
+
+# 仅取 socket 单元 ListenStream 的端口 (socket 激活时这才是真正决定端口的地方)
+_ssh_socket_ports() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    local item p out=""
+    for item in $(systemctl show -p Listen "${SERVICE_NAME}.socket" 2>/dev/null | sed 's/^Listen=//'); do
+        p=$(echo "$item" | sed 's/.*://')
+        [[ "$p" =~ ^[0-9]+$ ]] && out="${out} ${p}"
+    done
+    echo "$out" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u | tr '\n' ' '
+}
+
+# 仅取 sshd_config(含 Include) 里写的 Port
+_ssh_config_ports() {
+    grep -hE '^[[:space:]]*Port[[:space:]]+[0-9]+' "$SSH_CONF" /etc/ssh/sshd_config.d/*.conf 2>/dev/null \
+        | awk '{print $2}' | sort -u | tr '\n' ' '
 }
 
 # SSH 是否确实在监听。0=在监听/无法判定, 1=确认没有监听
@@ -821,6 +859,10 @@ change_port() {
     fi
 
     echo -e "${YELLOW}模式说明: [A]追加=保留 22 端口(更安全, 推荐); [R]替换=仅监听新端口。${NC}"
+    if ssh_is_socket_activated 2>/dev/null; then
+        echo -e "${YELLOW}本机为 ${CYAN}systemd socket 激活${YELLOW}模式: 端口由 ${CYAN}${SERVICE_NAME}.socket${YELLOW} 的 ListenStream 决定,"
+        echo -e "sshd_config 里的 Port ${RED}不会生效${YELLOW}; 脚本会同时更新两处, 以 socket 为准。${NC}"
+    fi
     echo -e "${RED}注意: 云服务器请先在“安全组/防火墙”放行新端口 ${new_port}, 否则可能连不上!${NC}"
     read -p "模式: [A]追加(保留22, 默认) | [R]替换(仅新端口): " p_mode
     [ -z "$p_mode" ] && p_mode="A"
@@ -874,6 +916,15 @@ change_port() {
         0) echo -e "${RED}⚠ 端口监听检测: 未发现 ${new_port} 在监听${NC}" ;;
         2) echo -e "${YELLOW}· 端口监听检测: 缺少 ss, 跳过${NC}" ;;
     esac
+    # socket 模式下额外核对: socket 的 ListenStream 是否真的包含新端口
+    if ssh_is_socket_activated 2>/dev/null; then
+        local _sp; _sp=$(_ssh_socket_ports)
+        case " $_sp " in
+            *" $new_port "*) echo -e "${GREEN}✓ socket 端口已包含 ${new_port} (当前: ${_sp})${NC}" ;;
+            *) echo -e "${RED}⚠ socket 的 ListenStream 未包含 ${new_port} (当前: ${_sp}) —— 该端口不会生效!${NC}"
+               listen_ok=0 ;;
+        esac
+    fi
     if [ "$tcp_ok" = 1 ]; then
         echo -e "${GREEN}✓ 本机 TCP 自连: 成功连上 ${new_port}${NC}"
     else
