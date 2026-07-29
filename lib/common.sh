@@ -196,6 +196,24 @@ port_listen_str() {
 ss_get_port() { [[ -f "$CONFIG_PATH" ]] && grep -oP '"server_port"\s*:\s*\K[0-9]+' "$CONFIG_PATH" 2>/dev/null | head -1; }
 mihomo_get_port() { [[ -f "$CONFIG_FILE" ]] && grep -oP '^\s*mixed-port:\s*\K[0-9]+' "$CONFIG_FILE" 2>/dev/null | head -1; }
 mihomo_get_controller() { [[ -f "$CONFIG_FILE" ]] && grep -oP '^\s*external-controller:\s*\K\S+' "$CONFIG_FILE" 2>/dev/null | head -1; }
+# SSH 生效端口(集中检测, 主面板与各模块共用):
+# socket 激活时以 ssh.socket 的 ListenStream 为准(此时 sshd_config 的 Port 被忽略),
+# 否则取 sshd_config(含 Include)的 Port; 结果去重, 避免出现 "88 88"。
+ssh_get_ports() {
+    local svc="${SERVICE_NAME:-ssh}" out="" item p
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "${svc}.socket" 2>/dev/null; then
+        for item in $(systemctl show -p Listen "${svc}.socket" 2>/dev/null | sed 's/^Listen=//'); do
+            p=$(echo "$item" | sed 's/.*://')
+            [[ "$p" =~ ^[0-9]+$ ]] && out="${out} ${p}"
+        done
+    fi
+    if [ -z "${out// /}" ]; then
+        out=$(grep -hE '^[[:space:]]*Port[[:space:]]+[0-9]+' "${SSH_CONF:-/etc/ssh/sshd_config}" /etc/ssh/sshd_config.d/*.conf 2>/dev/null | awk '{print $2}')
+    fi
+    [ -z "${out// /}" ] && out=22
+    echo "$out" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -un | tr '\n' ' '
+}
+
 reality_get_port() {
     [[ -f "$REALITY_CONFIG" ]] || return
     local p
@@ -458,8 +476,8 @@ check_status() {
     # 如果还是没找到，默认为yes
     [ -z "$pwd_auth" ] && pwd_auth="yes(默认)"
     
-    # 检测端口
-    local ports=$(grep "^Port " $SSH_CONF | awk '{print $2}' | xargs)
+    # 检测端口 (集中逻辑: socket 激活时以 ListenStream 为准, 且已去重)
+    local ports; ports=$(ssh_get_ports | xargs)
     [ -z "$ports" ] && ports="22(默认)"
     
     # 检测密钥文件

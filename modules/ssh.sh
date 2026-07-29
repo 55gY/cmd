@@ -160,18 +160,25 @@ configure_ssh_socket_ports() {
     done
     final_ports=("${uniq_ports[@]}")
 
-    # 写入配置
+    # 写入配置 —— 每个端口显式双栈双写 (0.0.0.0 + [::]) + BindIPv6Only=ipv6-only。
+    # 原因: 纯 "ListenStream=端口" 在部分 systemd 上会被设成 IPV6_V6ONLY=1, 仅监听 IPv6,
+    #       导致外部 IPv4 连接 Connection refused (实测 Ubuntu 24.04)。显式双写最可靠,
+    #       BindIPv6Only=ipv6-only 让 [::] 那条只管 IPv6, 与 0.0.0.0 那条不抢端口。
     mkdir -p "$dropin_dir"
     {
         echo "[Socket]"
         echo "ListenStream="
         for p in "${final_ports[@]}"; do
-            echo "ListenStream=${p}"
+            echo "ListenStream=0.0.0.0:${p}"
         done
+        for p in "${final_ports[@]}"; do
+            echo "ListenStream=[::]:${p}"
+        done
+        echo "BindIPv6Only=ipv6-only"
     } > "$override_file"
 
     systemctl daemon-reload
-    echo -e "${GREEN}  ✓ 已更新 ${socket_unit} 的监听端口: ${final_ports[*]}${NC}"
+    echo -e "${GREEN}  ✓ 已更新 ${socket_unit} 监听端口(IPv4+IPv6 双栈): ${final_ports[*]}${NC}"
 } # <--- 确保函数闭合
 
 # ---------- 安全应用层: 备份 / 校验 / 重启 / 回滚 (防止 SSH 锁死) ----------
@@ -349,6 +356,23 @@ _ssh_socket_ports() {
     echo "$out" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u | tr '\n' ' '
 }
 
+# 去重 sshd_config 里重复的 Port 行 (同一端口只保留第一次出现)
+_ssh_dedupe_config_ports() {
+    [ -f "$SSH_CONF" ] || return 0
+    local tmp before after
+    before=$(grep -cE '^[[:space:]]*Port[[:space:]]+[0-9]+' "$SSH_CONF" 2>/dev/null)
+    tmp=$(mktemp) || return 0
+    awk '
+        /^[[:space:]]*Port[[:space:]]+[0-9]+/ { if (seen[$2]++) next }
+        { print }
+    ' "$SSH_CONF" > "$tmp" 2>/dev/null && cat "$tmp" > "$SSH_CONF"
+    rm -f "$tmp"
+    after=$(grep -cE '^[[:space:]]*Port[[:space:]]+[0-9]+' "$SSH_CONF" 2>/dev/null)
+    if [ "${before:-0}" -gt "${after:-0}" ]; then
+        echo -e "${GREEN}  ✓ 已清理 sshd_config 中重复的 Port 行 (${before} → ${after})${NC}"
+    fi
+}
+
 # 仅取 sshd_config(含 Include) 里写的 Port
 _ssh_config_ports() {
     grep -hE '^[[:space:]]*Port[[:space:]]+[0-9]+' "$SSH_CONF" /etc/ssh/sshd_config.d/*.conf 2>/dev/null \
@@ -371,27 +395,38 @@ _ssh_listening_ok() {
 
 # 修正 socket override 中重复的 ListenStream (重复绑定会导致 Address already in use)
 # 返回 0=发现并已修正 / 1=无需修正或无法修正
+# 规整 socket override 为标准双栈写法: 每个端口写 0.0.0.0:P 与 [::]:P 各一条 + BindIPv6Only=ipv6-only。
+# 修复两类问题: (a)纯端口/[::]:P 只监听 IPv6 导致 IPv4 Connection refused; (b)端口重复。
+# 返回 0=已重写 / 1=已是标准写法, 无需改动
 _ssh_fix_socket_override() {
     local f="/etc/systemd/system/${SERVICE_NAME}.socket.d/override.conf"
     [ -f "$f" ] || return 1
-    local ports p q seen uniq=() n_all n_uniq
-    ports=$(grep -E '^[[:space:]]*ListenStream=[0-9]+' "$f" 2>/dev/null | sed 's/.*ListenStream=//')
-    [ -z "$ports" ] && return 1
-    for p in $ports; do
-        seen=0
-        for q in "${uniq[@]}"; do [ "$q" = "$p" ] && { seen=1; break; }; done
-        [ "$seen" -eq 0 ] && uniq+=("$p")
+    local raw ports_raw port q seen uniq=()
+    ports_raw=$(grep -E '^[[:space:]]*ListenStream=..*' "$f" 2>/dev/null | sed 's/^[[:space:]]*ListenStream=//')
+    [ -z "$ports_raw" ] && return 1
+    # 提取去重后的纯端口集合
+    for raw in $ports_raw; do
+        port="${raw##*:}"
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        seen=0; for q in "${uniq[@]}"; do [ "$q" = "$port" ] && { seen=1; break; }; done
+        [ "$seen" -eq 0 ] && uniq+=("$port")
     done
-    n_all=$(echo "$ports" | wc -w | tr -d ' '); n_uniq=${#uniq[@]}
-    [ "$n_all" -eq "$n_uniq" ] && return 1     # 没有重复
-    {
-        echo "[Socket]"
-        echo "ListenStream="
-        for p in "${uniq[@]}"; do echo "ListenStream=${p}"; done
-    } > "$f"
+    [ ${#uniq[@]} -eq 0 ] && return 1
+
+    # 生成标准内容, 与现文件比较; 一致则无需改动(幂等)
+    local want; want="$(
+        echo "[Socket]"; echo "ListenStream="
+        for port in "${uniq[@]}"; do echo "ListenStream=0.0.0.0:${port}"; done
+        for port in "${uniq[@]}"; do echo "ListenStream=[::]:${port}"; done
+        echo "BindIPv6Only=ipv6-only"
+    )"
+    if [ "$want" = "$(cat "$f" 2>/dev/null)" ]; then
+        return 1
+    fi
+    printf '%s\n' "$want" > "$f"
     systemctl daemon-reload >/dev/null 2>&1
     systemctl reset-failed "${SERVICE_NAME}.socket" "$SERVICE_NAME" >/dev/null 2>&1
-    echo -e "${GREEN}  ✓ 已修正 ${SERVICE_NAME}.socket 中重复的监听端口 (${n_all} 项 → ${n_uniq} 项: ${uniq[*]})${NC}"
+    echo -e "${GREEN}  ✓ 已将 ${SERVICE_NAME}.socket 规整为 IPv4+IPv6 双栈监听 (${uniq[*]}) —— 修复 IPv4 无法连接${NC}"
     return 0
 }
 
@@ -507,6 +542,21 @@ ssh_health_check() {
         en_k=$(systemctl is-enabled "${SERVICE_NAME}.socket" 2>/dev/null)
         [ "$en_s" = "masked" ] && SSH_HEALTH_ISSUES+=("${SERVICE_NAME}.service 被 mask (已屏蔽)")
         [ "$en_k" = "masked" ] && SSH_HEALTH_ISSUES+=("${SERVICE_NAME}.socket 被 mask (已屏蔽)")
+
+        # 3.4) 若 socket 有自定义端口但缺少 IPv4 监听(仅 IPv6, IPv4 会 refused),
+        #      体检时自动规整为标准双栈写法并重启 socket
+        local _ovf="/etc/systemd/system/${SERVICE_NAME}.socket.d/override.conf"
+        if [ -f "$_ovf" ] && command -v ss >/dev/null 2>&1; then
+            local _p _need=0
+            for _p in $(_ssh_socket_ports); do
+                if ! ss -ltnH "sport = :${_p}" 2>/dev/null | grep -q '0\.0\.0\.0:\|\*:'; then
+                    _need=1; break
+                fi
+            done
+            if [ "$_need" -eq 1 ]; then
+                _ssh_fix_socket_override && systemctl restart "${SERVICE_NAME}.socket" >/dev/null 2>&1
+            fi
+        fi
 
         # 3.5) socket 处于 failed: 明确指出常见根因(override 端口重复导致重复绑定)
         if [ "$(systemctl is-failed "${SERVICE_NAME}.socket" 2>/dev/null)" = "failed" ]; then
@@ -873,11 +923,16 @@ change_port() {
     # 修改配置逻辑
     if [[ "$p_mode" =~ ^[Aa]$ ]]; then
         sed -i 's/^#Port 22/Port 22/' "$SSH_CONF"
-        grep -q "^Port 22" "$SSH_CONF" || echo "Port 22" >> "$SSH_CONF"
-        grep -q "^Port $new_port" "$SSH_CONF" || sed -i "/^Port 22/a Port $new_port" "$SSH_CONF"
+        grep -qE "^[[:space:]]*Port[[:space:]]+22$" "$SSH_CONF" || echo "Port 22" >> "$SSH_CONF"
+        grep -qE "^[[:space:]]*Port[[:space:]]+${new_port}$" "$SSH_CONF" || echo "Port $new_port" >> "$SSH_CONF"
     else
-        sed -i "s/^#\?Port.*/Port $new_port/" "$SSH_CONF"
+        # 替换模式: 先删掉所有生效的 Port 行(保留 #Port 注释), 再写入唯一的新端口。
+        # 旧写法 sed 's/^#\?Port.*/Port N/' 会把每一行都改成同一个值 -> 出现重复的 "Port N"。
+        sed -i -E '/^[[:space:]]*Port[[:space:]]+[0-9]+[[:space:]]*$/d' "$SSH_CONF"
+        echo "Port $new_port" >> "$SSH_CONF"
     fi
+    # 兜底去重: 确保 sshd_config 中同一端口只出现一次
+    _ssh_dedupe_config_ports
 
     configure_ssh_socket_ports "$p_mode" "$new_port"
 
