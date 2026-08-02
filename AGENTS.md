@@ -101,3 +101,13 @@ modules/*.sh      各功能实现,按需加载(.sh 后缀)
 - **顺序要求**:先从配置解析出端口(`*_get_port`),**再**删除配置文件——否则端口丢失就无法回收放行。
 - 停服顺序:`stop` → `disable` → 删文件 → `daemon-reload` → `reset-failed`。
 - 卸载前一律用 `confirm` 二次确认;不代为卸载第三方组件(如 WARP)时需明确提示用户。
+
+## 7. SOCKS5 (Dante) 模块约束
+
+- 发行版差异: Debian/Ubuntu 为包 `dante-server` + 服务 `danted` + 配置 `/etc/danted.conf`; EL 系为 `sockd` + `/etc/sockd.conf`。用 common 的 `socks5_detect_paths` 统一探测(未安装时给出该发行版默认路径), 端口用 `socks5_get_port` 解析 `internal: ... port = N`。
+- **账号/密码/端口全随机**: 端口 `shuf -i 20000-60000`, 账号 `s5_` + 随机十六进制, 密码 20 位随机字母数字。
+- Dante 的 `socksmethod: username` 使用**系统账号**认证, 密码无法从 shadow 反查, 因此安装时必须把凭据写入 `${SOCKS5_INFO}`(默认 `/root/.socks5_credentials`, 权限 600)供“查看连接信息”使用。
+- 认证账号必须建成**无登录 shell**(`useradd -M -s nologin`), 不得可交互登录。
+- `external:` 需要出口网卡名, 用 `ip route get` 推导; 取不到则报错中止, 不要写死 eth0。
+- 重置/卸载必须: 先取旧端口与旧账号 → `close_firewall <port> tcp udp` → `userdel` 删除认证账号 → 删除配置/凭据/日志/drop-in。卸载时另行询问是否 purge 软件包。
+- 明文 SOCKS5 不加密流量, 查看信息时须提示用户注意, 并提醒云服务器放行安全组。

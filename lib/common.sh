@@ -42,6 +42,40 @@ AI_MODEL_PATH="$CONFIG_DIR/Model.bin"
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 
+# SOCKS5 (Dante) 相关路径 —— 兼容 Debian/Ubuntu(danted) 与 EL 系(sockd)
+SOCKS5_INFO="${SOCKS5_INFO:-/root/.socks5_credentials}"
+socks5_detect_paths() {
+    SOCKS5_CONF=""; SOCKS5_SERVICE=""; SOCKS5_BIN=""
+    if [ -x /usr/sbin/danted ] || command -v danted >/dev/null 2>&1; then
+        SOCKS5_BIN="$(command -v danted || echo /usr/sbin/danted)"
+        SOCKS5_CONF=/etc/danted.conf; SOCKS5_SERVICE=danted
+    elif [ -x /usr/sbin/sockd ] || command -v sockd >/dev/null 2>&1; then
+        SOCKS5_BIN="$(command -v sockd || echo /usr/sbin/sockd)"
+        SOCKS5_CONF=/etc/sockd.conf; SOCKS5_SERVICE=sockd
+    else
+        # 未安装时给出该发行版的默认目标路径
+        if [ -f /etc/debian_version ]; then
+            SOCKS5_CONF=/etc/danted.conf; SOCKS5_SERVICE=danted
+        else
+            SOCKS5_CONF=/etc/sockd.conf; SOCKS5_SERVICE=sockd
+        fi
+    fi
+    # 服务单元以实际存在的为准
+    if command -v systemctl >/dev/null 2>&1; then
+        local u
+        for u in danted sockd; do
+            if systemctl list-unit-files 2>/dev/null | grep -q "^${u}\.service"; then SOCKS5_SERVICE="$u"; break; fi
+        done
+    fi
+}
+
+# SOCKS5 监听端口 (解析 internal: ... port = N)
+socks5_get_port() {
+    [ -n "$SOCKS5_CONF" ] || socks5_detect_paths
+    [ -f "$SOCKS5_CONF" ] || return 0
+    grep -oP '^\s*internal:.*port\s*=\s*\K[0-9]+' "$SOCKS5_CONF" 2>/dev/null | head -1
+}
+
 # Reality (VLESS) 相关路径
 REALITY_CONFIG="${REALITY_CONFIG:-/usr/local/etc/xray/config.json}"
 REALITY_BIN="${REALITY_BIN:-$(command -v xray 2>/dev/null || echo /usr/local/bin/xray)}"
@@ -514,6 +548,20 @@ check_status() {
         fi
     fi
 
+    # 检测 SOCKS5 (Dante) 安装状态
+    local socks5_status="未安装"
+    local socks5_color="${RED_BOLD}"
+    socks5_detect_paths
+    if [ -n "$SOCKS5_BIN" ] && [ -f "$SOCKS5_CONF" ]; then
+        if systemctl is-active "$SOCKS5_SERVICE" >/dev/null 2>&1; then
+            socks5_status="已安装 + 运行中"
+            socks5_color="${GREEN_BOLD}"
+        else
+            socks5_status="已安装 未运行"
+            socks5_color="${YELLOW}"
+        fi
+    fi
+
     # 检测 Reality (VLESS) 安装状态
     local reality_status="未安装"
     local reality_color="${RED_BOLD}"
@@ -548,9 +596,12 @@ check_status() {
     if [[ "$ss_status" != "未安装" ]]; then _p=$(ss_get_port); [[ -n "$_p" ]] && ss_ps="  端口 ${_p}"; fi
     if [[ "$mihomo_status" != "未安装" ]]; then _p=$(mihomo_get_port); [[ -n "$_p" ]] && mihomo_ps="  端口 ${_p}"; fi
     if [[ "$reality_status" != "未安装" ]]; then _p=$(reality_get_port); [[ -n "$_p" ]] && reality_ps="  端口 ${_p}"; fi
+    local socks5_ps=""
+    if [[ "$socks5_status" != "未安装" ]]; then _p=$(socks5_get_port); [[ -n "$_p" ]] && socks5_ps="  端口 ${_p}"; fi
     echo -e "SS 状态             : ${ss_color}$ss_status${NC}${CYAN}${ss_ps}${NC}"
     echo -e "Mihomo 状态         : ${mihomo_color}$mihomo_status${NC}${CYAN}${mihomo_ps}${NC}"
     echo -e "Reality 状态        : ${reality_color}$reality_status${NC}${CYAN}${reality_ps}${NC}"
+    echo -e "SOCKS5 状态         : ${socks5_color}$socks5_status${NC}${CYAN}${socks5_ps}${NC}"
     
     # BBR 状态显示
     if [[ "$BBR_STATUS" == "已启用" ]]; then

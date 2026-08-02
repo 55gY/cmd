@@ -110,6 +110,7 @@ while true; do
     echo "6. 安装中文字体和 Locale"
     echo "7. Mihomo 管理"
     echo "8. Reality (VLESS) 管理"
+    echo "9. SOCKS5 (明文) 管理"
     echo "0. 退出"
     read -p "选择操作: " opt
     case $opt in
@@ -121,6 +122,7 @@ while true; do
         6) load_module system && { system_status_panel; install_chinese_support; read -n 1 -p "按任意键继续..."; } ;;
         7) load_module mihomo && mihomo_menu ;;
         8) load_module reality && reality_menu ;;
+        9) load_module socks5  && socks5_menu ;;
         0) exit 0 ;;
         *) echo "无效选项" ;;
     esac
