@@ -256,6 +256,36 @@ reality_get_port() {
     echo "$p"
 }
 
+# SSH 单项配置的“真正生效值”(集中, 主面板与各模块共用):
+# sshd 是“第一个未注释值生效”, 且 Include 的 drop-in 先读先赢, 只 grep 主文件会看错
+# (旧面板就因此谎报过 PasswordAuthentication)。优先用 `sshd -T`(解析 Include/Match),
+# 拿不到时按 Include 顺序手工解析兜底(Match 块之后的值只对匹配连接生效, 不算全局值)。
+# 用法: ssh_effective_value <Key>   输出值(如 yes/no), 取不到输出空
+ssh_effective_value() {
+    local key="$1" lower_key val sshd_bin f
+    lower_key=$(echo "$key" | tr '[:upper:]' '[:lower:]')
+    sshd_bin="$(command -v sshd || echo /usr/sbin/sshd)"
+    if [ -x "$sshd_bin" ]; then
+        val=$("$sshd_bin" -T -f "${SSH_CONF:-/etc/ssh/sshd_config}" 2>/dev/null \
+            | awk -v k="$lower_key" '$1 == k { print $2; exit }')
+        [ -n "$val" ] && { echo "$val"; return 0; }
+    fi
+    local files=()
+    for f in /etc/ssh/sshd_config.d/*.conf; do [ -f "$f" ] && files+=("$f"); done
+    files+=("${SSH_CONF:-/etc/ssh/sshd_config}")
+    awk -v k="$key" '
+        FNR == 1 { in_match = 0 }
+        {
+            t = $0; sub(/^[[:space:]]+/, "", t)
+            if (t == "" || t ~ /^#/) next
+            if (t ~ /^Match([[:space:]]|$)/) { in_match = 1; next }
+            if (in_match) next
+            n = split(t, f, /[[:space:]]+/)
+            if (n >= 2 && tolower(f[1]) == tolower(k)) { print f[2]; exit }
+        }
+    ' "${files[@]}" 2>/dev/null
+}
+
 # ---------- 通用: 统一确认提示 (全项目复用) ----------
 # 约定: 直接回车 = 确认(是); 输入 n / no = 拒绝。返回 0=确认 / 1=拒绝
 # 用法: if confirm "是否继续?"; then ... fi   /   confirm "..." || return
@@ -481,33 +511,12 @@ check_status() {
         echo -e "当前 Locale         : ${GREEN_BOLD}$current_locale${NC}"
     fi
     
-    # 检测 Root 登录状态
-    local root_login=$(grep "^PermitRootLogin" $SSH_CONF | awk '{print $2}')
+    # 检测 Root 登录 / 密码验证状态: 一律取真正生效值(sshd -T 或 Include 顺序解析),
+    # 不要只 grep 主文件——drop-in 先读先赢, 旧写法会在云镜像上谎报状态
+    local root_login; root_login=$(ssh_effective_value PermitRootLogin)
     [ -z "$root_login" ] && root_login="默认(prohibit-password)"
-    
-    # 检测密码验证状态（优先检查云平台配置）
-    local pwd_auth=""
-    local config_dir="/etc/ssh/sshd_config.d"
-    
-    # 首先检查云平台配置文件
-    if [ -d "$config_dir" ]; then
-        for conf_file in "60-cloudimg-settings.conf" "50-cloud-init.conf" "99-cloudimg-settings.conf"; do
-            if [ -f "$config_dir/$conf_file" ]; then
-                local cloud_pwd=$(grep "^PasswordAuthentication" "$config_dir/$conf_file" 2>/dev/null | awk '{print $2}')
-                if [ -n "$cloud_pwd" ]; then
-                    pwd_auth="$cloud_pwd"
-                    break
-                fi
-            fi
-        done
-    fi
-    
-    # 如果云平台配置中没有，检查主配置文件
-    if [ -z "$pwd_auth" ]; then
-        pwd_auth=$(grep "^PasswordAuthentication" $SSH_CONF 2>/dev/null | awk '{print $2}')
-    fi
-    
-    # 如果还是没找到，默认为yes
+
+    local pwd_auth; pwd_auth=$(ssh_effective_value PasswordAuthentication)
     [ -z "$pwd_auth" ] && pwd_auth="yes(默认)"
     
     # 检测端口 (集中逻辑: socket 激活时以 ListenStream 为准, 且已去重)

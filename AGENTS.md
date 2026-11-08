@@ -70,7 +70,31 @@ modules/*.sh      各功能实现,按需加载(.sh 后缀)
 - 任何 sshd 配置改动**改前必须 `ssh_backup`**(备份 sshd_config + `sshd_config.d` + socket override 到时间戳压缩包)。
 - 应用一律走 `ssh_safe_apply`:`sshd -t` 校验 → 重启 → 验证服务 `is-active`;**任一失败自动 `ssh_restore` 回滚**,绝不 `exit` 整个脚本。
 - 改端口:默认 [A]追加保留 22;重启前先调 common 的 **`open_firewall <端口> tcp`** 放行本机防火墙(**ufw / firewalld / iptables+ip6tables 双栈**,`-C` 幂等去重,尽力持久化 netfilter-persistent / rules.v4·v6 / `service iptables save`;仅 nftables 无 ufw·firewalld 时提示手动放行);SELinux 用 `semanage port -a || -m`;重启后做两项自检——**新端口在监听**(`ss`)+ **本机 TCP 自连测试**(`_ssh_tcp_check`,优先 `bash /dev/tcp` 回退 `nc`),任一失败即提示回滚;强提示云服务器仍需在安全组另行放行(本机放行/自连不代表外网可达)。
-- **禁用密码登录前必须确认 `authorized_keys` 含有效公钥**,否则拒绝禁用。
+- **禁用密码登录必须是两阶段, 中间夹一次真人实测(2026-11-08 修锁死)**:
+  旧流程一次跑完“生成密钥→关密码”, 守卫只是 grep 文件里有没有密钥形状的行,
+  从不验证用户手里的私钥是否匹配、sshd 是否真会接受, 结果就是“关完密码和
+  密钥都登不上”。新流程: 第一步只开密钥登录(密码保持可用)并核对 `sshd -T`
+  生效值; 第二步必须由用户在新会话里真的用密钥登上, 再手输 `yes` 确认
+  (`_ssh_confirm_explicit`, 必须手输 yes, 回车不算——这是对 §4“回车=是”约定的
+  唯一例外, 因为这道门默认通过等于没设门); 只有确认后才关密码。任何一步失败
+  都停在密码还开着的状态。
+- **关密码必须同时关 `KbdInteractiveAuthentication`**: 只关
+  `PasswordAuthentication` 时, Ubuntu 上密码仍能走键盘交互(默认 yes + UsePAM)
+  登录, 等于没关; 三项生效值(PasswordAuthentication=no、
+  KbdInteractiveAuthentication=no、PubkeyAuthentication=yes)须在应用后用
+  `ssh_effective_value` 逐一核对, 不符即回滚。
+- **`set_ssh_config` 契约**: 主文件是唯一事实来源——先清掉全部 drop-in
+  (不限文件名, 旧版只认 3 个云文件名会漏网)与主文件全局区的同名行, 再把唯一值
+  写进主文件第一个 `Match` 块之前(写进 Match 块之后会落进 Match 上下文, 全局不
+  生效); 写完必须用 `ssh_effective_value` 核对生效值, 不要只信文件写了什么。
+  清同名行是有意的窄例外: 只删“正要改写的同一个 key”的重复行且只在全局区
+  (Match 块内保留), 不是 §6 禁的按关键字类全局删除他人配置。
+- **`authorized_keys` 追加必须补尾换行**: 原文件缺尾换行时 `cat >>` 会把新公钥
+  吞进上一行注释, 新密钥实际不存在; 追加前先校验每行是合法公钥行
+  (`_ssh_validate_authkeys`, 含证书型), 权限每次都修(700 目录 / 600 文件 /
+  属主 root / 去 /root 的组写权限 / RHEL 系 `restorecon`), 不只新生成密钥时。
+- **回滚定时器先布防再改动**: 关密码那一步须在改配置前 `ssh_arm_autorollback 300`
+  (原 120 秒不够下载私钥+开新会话测试), 备份取改动前密码还开着的状态。
 - 提供**定时自动回滚** `ssh_arm_autorollback`(默认 120s,`setsid` 脱离会话):另开会话确认可登录后 `touch <keep 文件>` 取消,否则到时自动恢复原配置。sshd 重启不会中断现有会话,故可安全测试。
 - **socket 端口必须「IPv4+IPv6 双栈双写」(踩过的坑, 已在 Ubuntu 24.04 实测纠正)**:不能依赖"纯端口 `ListenStream=88` 会自动双栈"——实测部分 systemd 会把纯端口套接字设成 `IPV6_V6ONLY=1`, 结果只监听 `[::]:88`(IPv6), 外部 IPv4 连接直接 `Connection refused`, 且此时 `net.ipv6.bindv6only=0` 也救不了(是 per-socket 覆盖了系统默认)。**可靠写法**是每个端口显式写两条 + 强制 IPv6 单栈, 让 IPv4/IPv6 各绑各的、不抢端口:
   ```

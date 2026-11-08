@@ -5,8 +5,9 @@
 ssh_status_panel() {
     detect_os
     local root_login pwd_auth ports
-    root_login=$(grep "^PermitRootLogin" "$SSH_CONF" 2>/dev/null | awk '{print $2}'); [ -z "$root_login" ] && root_login="默认(prohibit-password)"
-    pwd_auth=$(grep "^PasswordAuthentication" "$SSH_CONF" 2>/dev/null | awk '{print $2}'); [ -z "$pwd_auth" ] && pwd_auth="yes(默认)"
+    # 取真正生效值(不要只 grep 主文件, drop-in 先读先赢)
+    root_login=$(ssh_effective_value PermitRootLogin); [ -z "$root_login" ] && root_login="默认(prohibit-password)"
+    pwd_auth=$(ssh_effective_value PasswordAuthentication); [ -z "$pwd_auth" ] && pwd_auth="yes(默认)"
     panel_top "SSH 状态检测"
     if [[ "$root_login" =~ ^(yes|YES)$ ]]; then
         echo -e "Root 登录        : ${GREEN_BOLD}${root_login}${NC}"
@@ -60,40 +61,76 @@ ssh_status_panel() {
     panel_bot
 }
 
+# _ssh_strip_key_lines <文件> <key>: 删掉文件全局区(第一个 Match 块之前)所有与
+# key 同名的行(生效行与注释行都删; 只认“第一个字段恰好等于 key”, 不会误删
+# 带前缀的其它项)。Match 块内的同名行保留(它们只对匹配连接生效)。
+# 注意: 这是有意的窄例外——AGENTS §6 禁的是按关键字类全局删除他人配置; 这里
+# 只删“正要改写的同一个 key”的重复行, 且只在全局区, 否则 sshd“第一个值生效”
+# 会让新值被旧行顶掉(旧版末尾追加就是这么锁死的)。Port 行去重同理。
+_ssh_strip_key_lines() {
+    local file="$1" key="$2" tmp
+    [ -f "$file" ] || return 0
+    tmp=$(mktemp) || return 1
+    awk -v k="$key" '
+        FNR == 1 { in_match = 0 }
+        {
+            line = $0
+            t = line; sub(/^[[:space:]]+/, "", t)
+            if (t ~ /^Match([[:space:]]|$)/) { in_match = 1; print line; next }
+            if (in_match) { print line; next }
+            if (t == "" || t ~ /^#/) { print line; next }
+            n = split(t, f, /[[:space:]]+/)
+            if (n >= 1 && tolower(f[1]) == tolower(k)) { next }
+            print line
+        }
+    ' "$file" > "$tmp" 2>/dev/null && cat "$tmp" > "$file"
+    rm -f "$tmp"
+}
+
+# 写单个 sshd 配置项。旧版有两个致命问题:
+#   1) 只认行首无空格的 ^#\?Key, 前导空格 / "# " 注释行匹配不到, 只能追加到
+#      文件末尾; sshd 是“第一个未注释值生效”, 末尾的新值直接被忽略。
+#   2) drop-in 只认 3 个写死的云文件名, 其它 drop-in 里的同名项(Include 在文件
+#      头, drop-in 先读先赢)会顶掉主文件, 改了等于没改。
+# 新版: 主文件是唯一事实来源——先清掉全部 drop-in 与主文件全局区的同名行,
+# 再把唯一值写进主文件第一个 Match 块之前(写进 Match 块之后会落进 Match 上下文,
+# 全局不生效)。写完务必用 ssh_effective_value() 核对生效值。
 set_ssh_config() {
     local key="$1"
     local value="$2"
-    local pattern="^#\\?${key}"
-    
-    # 转义 value 中的特殊字符（用于 sed）
-    local escaped_value=$(echo "$value" | sed 's/[&/\\]/\\&/g')
-    
-    # 检查是否存在 sshd_config.d 目录
     local config_dir="/etc/ssh/sshd_config.d"
-    local cloud_config=""
-    
-    # 查找云平台配置文件
+    local cleaned="" f tmp
+
+    # 1) 清掉全部 drop-in 里的同名项(不限文件名)
     if [ -d "$config_dir" ]; then
-        # AWS, Google Cloud 等常见配置文件
-        for conf_file in "60-cloudimg-settings.conf" "50-cloud-init.conf" "99-cloudimg-settings.conf"; do
-            if [ -f "$config_dir/$conf_file" ]; then
-                cloud_config="$config_dir/$conf_file"
-                echo -e "${BLUE}  检测到云平台配置: $conf_file${NC}"
-                # 修改云平台配置文件
-                if grep -q "$pattern" "$cloud_config"; then
-                    sed -i "s/$pattern.*/${key} ${escaped_value}/" "$cloud_config"
-                    echo -e "${GREEN}  ✓ 已更新 $conf_file 中的 $key${NC}"
-                fi
+        for f in "$config_dir"/*.conf; do
+            [ -f "$f" ] || continue
+            if grep -qE "^[[:space:]]*#?[[:space:]]*${key}([[:space:]]+|$)" "$f" 2>/dev/null; then
+                _ssh_strip_key_lines "$f" "$key"
+                cleaned="${cleaned}$(basename "$f") "
             fi
         done
     fi
-    
-    # 同时修改主配置文件
-    if grep -q "$pattern" "$SSH_CONF"; then
-        sed -i "s/$pattern.*/${key} ${escaped_value}/" "$SSH_CONF"
-    else
-        echo "${key} ${value}" >> "$SSH_CONF"
+    [ -n "$cleaned" ] && echo -e "${BLUE}  已清除 drop-in 中的旧值: ${cleaned}${NC}"
+
+    # 2) 主文件: 先清全局区同名行, 再在第一个 Match 块之前写入唯一值
+    if [ ! -f "$SSH_CONF" ]; then
+        echo "${key} ${value}" > "$SSH_CONF"
+        echo -e "${GREEN}  ✓ 已写入 ${SSH_CONF}: ${key} ${value}${NC}"
+        return 0
     fi
+    _ssh_strip_key_lines "$SSH_CONF" "$key"
+    tmp=$(mktemp) || return 1
+    awk -v line="${key} ${value}" '
+        BEGIN { inserted = 0 }
+        {
+            t = $0; sub(/^[[:space:]]+/, "", t)
+            if (!inserted && t ~ /^Match([[:space:]]|$)/) { print line; inserted = 1 }
+            print $0
+        }
+        END { if (!inserted) print line }
+    ' "$SSH_CONF" > "$tmp" 2>/dev/null && cat "$tmp" > "$SSH_CONF"
+    rm -f "$tmp"
     echo -e "${GREEN}  ✓ 已更新主配置文件中的 $key${NC}"
 }
 
@@ -745,12 +782,101 @@ ssh_preflight() {
     fi
 }
 
+# ---------- 密钥登录防锁死: 公钥校验 / 权限修复 / 安全追加 ----------
+# 防锁死确认: 必须手输 yes 才算确认, 回车/其它输入一律算取消。
+# 例外说明: 全项目 confirm() 约定“回车=是”, 但“密钥已在新会话实测可用”是
+# 防锁死的最后一道门, 回车默认通过等于没设门, 故此处故意不用 confirm()(见 AGENTS §5)。
+_ssh_confirm_explicit() {
+    local _prompt="$1" _ans
+    read -r -p "$(echo -e "${_prompt} [输入 ${GREEN}yes${NC} 确认, 其它=取消]: ")" _ans
+    [ "$_ans" = "yes" ]
+}
+
+# 已知公钥类型(含证书型, 用于校验 authorized_keys / 粘贴的公钥行)
+_SSH_KEY_TYPES_RE='ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com|ssh-rsa-cert-v01@openssh.com|ssh-dss-cert-v01@openssh.com|ecdsa-sha2-nistp256-cert-v01@openssh.com|ecdsa-sha2-nistp384-cert-v01@openssh.com|ecdsa-sha2-nistp521-cert-v01@openssh.com|ssh-ed25519-cert-v01@openssh.com|sk-ssh-ed25519-cert-v01@openssh.com|sk-ecdsa-sha2-nistp256-cert-v01@openssh.com'
+
+# 校验一行公钥文本(允许带 from=/command= 等选项前缀): 0=合法
+_ssh_valid_pubkey_line() {
+    echo "$1" | awk -v types="$_SSH_KEY_TYPES_RE" '
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ "^(" types ")$") {
+                    if (i + 1 <= NF && $(i+1) ~ /^[A-Za-z0-9+\/=]+$/) exit 0
+                    exit 1
+                }
+            }
+            exit 1
+        }'
+}
+
+# 校验 authorized_keys: stdout 只输出合法密钥数, 非法行告警走 stderr。
+# 返回 0=至少 1 把合法密钥 / 1=无合法密钥
+_ssh_validate_authkeys() {
+    local file="${1:-$AUTH_KEYS}" valid=0 total=0 line
+    [ -f "$file" ] || { echo 0; return 1; }
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ""|"#"*) continue ;; esac
+        total=$((total + 1))
+        if _ssh_valid_pubkey_line "$line"; then
+            valid=$((valid + 1))
+        else
+            echo -e "${RED}  ✗ authorized_keys 第 ${total} 行无法解析(不是合法公钥行): ${line:0:60}${NC}" >&2
+        fi
+    done < "$file"
+    echo "$valid"
+    [ "$valid" -ge 1 ]
+}
+
+# 修复 authorized_keys 相关权限(每次都做, 不只新生成密钥时):
+# StrictModes 下 .ssh 目录 / authorized_keys 属主不对或组/其它可写都会导致
+# 密钥登录静默失败(日志里只有 "Authentication refused: bad ownership or modes");
+# $HOME 组/其它可写同样会拒密钥; RHEL 系还要修 SELinux context。
+_ssh_fix_authkeys_perms() {
+    mkdir -p /root/.ssh 2>/dev/null
+    chmod 700 /root/.ssh 2>/dev/null
+    chown root:root /root/.ssh 2>/dev/null
+    [ -d /root ] && chmod go-w /root 2>/dev/null
+    if [ -f "$AUTH_KEYS" ]; then
+        chmod 600 "$AUTH_KEYS" 2>/dev/null
+        chown root:root "$AUTH_KEYS" 2>/dev/null
+    fi
+    if command -v restorecon >/dev/null 2>&1; then
+        restorecon -R /root/.ssh >/dev/null 2>&1 && echo -e "${GREEN}  ✓ 已修复 /root/.ssh 的 SELinux context${NC}"
+    fi
+}
+
+# 安全追加公钥(参数为公钥文件路径或一行公钥文本): 先补尾换行, 已存在同一密钥时跳过。
+# 旧版 `cat pub >> authorized_keys` 不补尾换行: 原文件缺尾换行时新密钥会被吞进
+# 上一行注释里, 新密钥实际不存在, 而旧版守卫又因旧密钥在行首而放行——这就是
+# “关密码后新密钥也登不上”的一种实测成因。
+_ssh_append_pubkey() {
+    local src="$1" blob line
+    if [ -f "$src" ]; then line=$(cat "$src"); else line="$src"; fi
+    blob=$(echo "$line" | awk -v types="$_SSH_KEY_TYPES_RE" '{ for (i=1;i<=NF;i++) if ($i ~ "^(" types ")$") { print $(i+1); exit } }')
+    [ -z "$blob" ] && { echo -e "${RED}  ✗ 公钥格式无法识别${NC}"; return 1; }
+    if [ -f "$AUTH_KEYS" ] && grep -qF "$blob" "$AUTH_KEYS" 2>/dev/null; then
+        echo -e "${GREEN}  ✓ 该公钥已在 authorized_keys 中, 跳过追加${NC}"
+        return 0
+    fi
+    # 文件非空且最后一字节不是换行时先补一个换行
+    if [ -s "$AUTH_KEYS" ] && [ -n "$(tail -c 1 "$AUTH_KEYS" 2>/dev/null)" ]; then
+        echo >> "$AUTH_KEYS"
+    fi
+    printf '%s\n' "$line" >> "$AUTH_KEYS"
+    _ssh_fix_authkeys_perms
+    echo -e "${GREEN}  ✓ 公钥已追加到 authorized_keys${NC}"
+    return 0
+}
+
 # --- 4. 功能：启用密钥登录 ---
 enable_key_login() {
     echo -e "\n${YELLOW}[操作] 正在配置 Root 密钥登录...${NC}"
+    echo -e "${BLUE}流程分两步, 密码是最后才关的:${NC}"
+    echo -e "${BLUE}  第一步: 只开密钥登录, 密码保持可用, 你另开会话实测密钥能登;${NC}"
+    echo -e "${BLUE}  第二步: 你亲口确认密钥已登上, 脚本才关密码。任何一步失败都停在这里, 密码还开着, 不会锁死。${NC}"
     # 前置: sshd 服务本身异常时先修复, 避免误判与锁死
     ssh_preflight || return 1
-    mkdir -p /root/.ssh && chmod 700 /root/.ssh
+    _ssh_fix_authkeys_perms
 
     # 检查是否存在云平台的root登录限制
     if [ -f "$AUTH_KEYS" ] && grep -q 'command=".*Please login as the user.*rather than.*root' "$AUTH_KEYS"; then
@@ -762,15 +888,15 @@ enable_key_login() {
         echo ""
         if confirm "是否清理此限制以允许 root 登录？"; then
             echo -e "${BLUE}正在清理云平台限制...${NC}"
-            
+
             # 备份原文件
             local backup_file="${AUTH_KEYS}.bak.$(date +%Y%m%d%H%M%S)"
             cp "$AUTH_KEYS" "$backup_file"
             echo -e "${GREEN}✓ 已备份到: $backup_file${NC}"
-            
+
             # 使用sed清理：移除所有选项前缀，只保留密钥类型开始的部分
             sed -i 's/^.*\(ssh-rsa\|ssh-ed25519\|ecdsa-sha2-nistp[0-9]\+\|ssh-dss\)/\1/' "$AUTH_KEYS"
-            
+
             echo -e "${GREEN}✓ 已清理云平台限制${NC}"
             echo -e "${YELLOW}提示: 如需恢复，备份文件: $backup_file${NC}"
         else
@@ -779,117 +905,164 @@ enable_key_login() {
         fi
     fi
 
-    # 判断是否需要生成新密钥
-    local need_new_key=false
-    if [ ! -f "$AUTH_KEYS" ]; then
-        need_new_key=true
-        echo -e "${YELLOW}密钥文件不存在，将生成新密钥对...${NC}"
-    else
-        echo -e "${BLUE}密钥文件已存在 (包含 $(wc -l < $AUTH_KEYS 2>/dev/null || echo "0") 个密钥)${NC}"
-        confirm "是否添加新的密钥对？" && need_new_key=true
-    fi
-
-    if [ "$need_new_key" = true ]; then
-        echo -e "${BLUE}生成 4096 位 RSA 密钥对...${NC}"
-        local key_name="/root/.ssh/id_rsa"
-        
-        # 如果已存在，使用新文件名
-        if [ -f "$key_name" ]; then
-            key_name="/root/.ssh/id_rsa_$(date +%Y%m%d%H%M%S)"
-            echo -e "${YELLOW}检测到已存在密钥，使用新文件名: $(basename $key_name)${NC}"
-        fi
-        
-        ssh-keygen -t rsa -b 4096 -f "$key_name" -N "" -C "root@$(hostname)"
-        
-        if [ $? -eq 0 ]; then
-            cat "${key_name}.pub" >> "$AUTH_KEYS"
-            chmod 600 "$AUTH_KEYS"
-            echo -e "${GREEN}✓ 密钥对已生成${NC}"
-            echo -e "${GREEN}✓ 公钥已添加到 authorized_keys${NC}"
-            echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-            echo -e "${RED}重要: 请立即下载私钥文件！${NC}"
-            echo -e "${RED}私钥路径: $key_name${NC}"
-            echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        else
-            echo -e "${RED}密钥生成失败！${NC}"
+    # --- 公钥来源: 优先粘贴你自己的公钥, 留空才在服务器生成新密钥对 ---
+    # 旧版只有服务器生成一条路: 用户若没下载 /root/.ssh/id_rsa(或拿错成 .pub),
+    # 关密码后手里根本没有能登的私钥——这是最常见的锁死。
+    local pasted_key=""
+    echo -e "\n${BLUE}粘贴你自己的公钥(本地 ~/.ssh/id_ed25519.pub 或 id_rsa.pub 的整行内容),${NC}"
+    echo -e "${BLUE}直接回车则在服务器生成新密钥对(仍需你随后下载私钥)。${NC}"
+    read -r -p "公钥(留空=服务器生成): " pasted_key
+    local generated_key=""
+    if [ -n "$pasted_key" ]; then
+        if ! _ssh_valid_pubkey_line "$pasted_key"; then
+            echo -e "${RED}粘贴的不是合法公钥行(应以 ssh-rsa / ssh-ed25519 等开头, 第二段为 base64)。未做任何改动。${NC}"
             return 1
         fi
+        _ssh_append_pubkey "$pasted_key" || return 1
+    else
+        # 判断是否需要生成新密钥
+        local need_new_key=false
+        if [ ! -f "$AUTH_KEYS" ]; then
+            need_new_key=true
+            echo -e "${YELLOW}密钥文件不存在，将生成新密钥对...${NC}"
+        else
+            echo -e "${BLUE}密钥文件已存在 (包含 $(wc -l < $AUTH_KEYS 2>/dev/null || echo "0") 行)${NC}"
+            confirm "是否添加新的密钥对？" && need_new_key=true
+        fi
+
+        if [ "$need_new_key" = true ]; then
+            echo -e "${BLUE}生成 4096 位 RSA 密钥对...${NC}"
+            local key_name="/root/.ssh/id_rsa"
+
+            # 如果已存在，使用新文件名
+            if [ -f "$key_name" ]; then
+                key_name="/root/.ssh/id_rsa_$(date +%Y%m%d%H%M%S)"
+                echo -e "${YELLOW}检测到已存在密钥，使用新文件名: $(basename $key_name)${NC}"
+            fi
+
+            ssh-keygen -t rsa -b 4096 -f "$key_name" -N "" -C "root@$(hostname)"
+
+            if [ $? -eq 0 ]; then
+                generated_key="$key_name"
+                _ssh_append_pubkey "${key_name}.pub" || return 1
+                echo -e "${GREEN}✓ 密钥对已生成${NC}"
+                echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+                echo -e "${RED}重要: 请立即下载私钥文件！${NC}"
+                echo -e "${RED}私钥路径: $key_name${NC}"
+                echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            else
+                echo -e "${RED}密钥生成失败！${NC}"
+                return 1
+            fi
+        fi
     fi
 
-    # 配置 SSH (改动前先备份, 失败可自动回滚)
-    echo -e "${BLUE}配置 SSH 服务...${NC}"
+    # 关密码之前先校验: authorized_keys 必须至少含 1 把合法密钥, 否则停在这里
+    local valid_keys=0
+    valid_keys=$(_ssh_validate_authkeys)
+    if [ "$valid_keys" -lt 1 ]; then
+        echo -e "${RED}authorized_keys 中没有合法公钥, 未改动任何 SSH 配置。${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}✓ authorized_keys 校验通过 (合法密钥 ${valid_keys} 把)${NC}"
+
+    # ---------- 第一步: 只开密钥登录, 密码保持可用 ----------
+    echo -e "\n${BLUE}[第一步] 开启密钥登录(密码暂不动)...${NC}"
     ssh_backup
     set_ssh_config "PermitRootLogin" "yes"
     set_ssh_config "PubkeyAuthentication" "yes"
     set_ssh_config "AuthorizedKeysFile" ".ssh/authorized_keys"
-    
-    # 检查当前密码登录状态
-    local current_pwd_auth=""
-    local config_dir="/etc/ssh/sshd_config.d"
-    
-    # 首先检查云平台配置文件
-    if [ -d "$config_dir" ]; then
-        for conf_file in "60-cloudimg-settings.conf" "50-cloud-init.conf" "99-cloudimg-settings.conf"; do
-            if [ -f "$config_dir/$conf_file" ]; then
-                local cloud_pwd=$(grep "^PasswordAuthentication" "$config_dir/$conf_file" 2>/dev/null | awk '{print $2}')
-                if [ -n "$cloud_pwd" ]; then
-                    current_pwd_auth="$cloud_pwd"
-                    break
-                fi
-            fi
-        done
+
+    if ! ssh_safe_apply; then
+        echo -e "${RED}SSH 配置应用失败, 已回滚到改动前状态, 未做更改。${NC}"
+        return 1
     fi
-    
-    # 如果云平台配置中没有，检查主配置文件
-    if [ -z "$current_pwd_auth" ]; then
-        current_pwd_auth=$(grep "^PasswordAuthentication" "$SSH_CONF" 2>/dev/null | awk '{print $2}')
+    # 核对生效值(不要只信文件写了什么): PubkeyAuthentication 必须真生效
+    if [ "$(ssh_effective_value PubkeyAuthentication)" != "yes" ]; then
+        echo -e "${RED}生效值核对失败: PubkeyAuthentication 不是 yes(可能被其它配置顶掉), 正在回滚...${NC}"
+        ssh_restore
+        return 1
     fi
-    
-    # 如果还是没找到，默认为yes
-    [ -z "$current_pwd_auth" ] && current_pwd_auth="yes"
-    
-    # 询问是否禁用密码登录
-    echo -e "\n${BLUE}当前密码登录状态: ${YELLOW}$current_pwd_auth${NC}"
-    
-    if [[ "$current_pwd_auth" == "no" ]]; then
-        echo -e "${GREEN}密码登录已禁用，安全性较高${NC}"
-    else
-        echo -e "${YELLOW}建议禁用密码登录以提高安全性${NC}"
-        echo -e "${RED}警告: 禁用后只能使用密钥登录，请确保已下载私钥！${NC}"
-        if confirm "是否禁用密码登录？"; then
-            if [ ! -s "$AUTH_KEYS" ] || ! grep -qE '^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp[0-9]+|ssh-dss|sk-ssh|sk-ecdsa)' "$AUTH_KEYS"; then
-                echo -e "${RED}authorized_keys 中未发现有效公钥, 为避免锁死, 已拒绝禁用密码登录!${NC}"
-                echo -e "${YELLOW}请先确认密钥登录可用, 再来禁用密码。${NC}"
-            else
-                set_ssh_config "PasswordAuthentication" "no"
-                echo -e "${GREEN}已禁用密码登录${NC}"
-            fi
-        else
-            echo -e "${YELLOW}已保留密码登录${NC}"
-        fi
-    fi
-    
+    echo -e "${GREEN}✓ 密钥登录已生效, 且密码登录仍保留(兜底)。${NC}"
+
     # 显示当前 authorized_keys 内容（仅显示前几个字符）
     echo -e "\n${BLUE}当前 authorized_keys 内容:${NC}"
     if [ -f "$AUTH_KEYS" ]; then
         awk '{print NR". " substr($1,1,20)"... " substr($2,1,30)"... " $3}' "$AUTH_KEYS"
     fi
-    
-    if ssh_safe_apply; then
-        ssh_offer_autorollback
+
+    # ---------- 实测门: 必须在新会话里真的登上, 才允许进第二步 ----------
+    # 旧版只 grep 文件里有没有密钥形状的行就敢关密码, 从不验证用户手里的私钥
+    # 是否匹配、sshd 是否真会接受——这就是“关完密码和密钥都登不上”的主因。
+    echo -e "\n${YELLOW}现在请另开一个新会话, 用密钥登录一次:${NC}"
+    if [ -n "$generated_key" ]; then
+        echo -e "  ${GREEN}ssh -i ${generated_key} root@服务器IP${NC}  (私钥先下载到本地, 并 chmod 600 私钥文件)"
     else
-        echo -e "${RED}SSH 配置应用失败, 已回滚到改动前状态, 未做更改。${NC}"
-        return 1
+        echo -e "  ${GREEN}ssh root@服务器IP${NC}  (用你粘贴公钥时对应的私钥)"
+    fi
+    echo -e "${RED}不要断开当前会话! 当前会话是你的救命绳。${NC}"
+    if ! _ssh_confirm_explicit "已在新会话用密钥登录成功"; then
+        echo -e "${YELLOW}未确认密钥登录成功, 停在这里。密码登录仍保留, 密钥登录也已开启, 随时可以重测。${NC}"
+        echo -e "${YELLOW}排查方向: 私钥是否拿对(服务器生成的私钥是 ${generated_key:-<无, 用的是你粘贴的公钥>})、本地私钥权限是否为 600、authorized_keys 是否含对应公钥。${NC}"
+        return 0
+    fi
+
+    # ---------- 第二步: 关密码 ----------
+    local pwd_disabled=false
+    local current_pwd_auth; current_pwd_auth=$(ssh_effective_value PasswordAuthentication)
+    [ -z "$current_pwd_auth" ] && current_pwd_auth="yes"
+    echo -e "\n${BLUE}当前密码登录状态(生效值): ${YELLOW}$current_pwd_auth${NC}"
+
+    if [[ "$current_pwd_auth" == "no" ]]; then
+        echo -e "${GREEN}密码登录已禁用, 无需再关。${NC}"
+        pwd_disabled=true
+    else
+        echo -e "${YELLOW}密钥登录已实测可用, 现在可以安全禁用密码登录。${NC}"
+        if confirm "是否禁用密码登录？"; then
+            # 先布防再改: 回滚定时器要在改动前武装, 否则改完锁死时没人兜底。
+            # 备份是第一步之前的状态(密码还开着), 回滚即回到密码可用。
+            ssh_backup
+            ssh_arm_autorollback 300
+            # 只关 PasswordAuthentication 不够: Ubuntu 上密码还能走键盘交互
+            # (KbdInteractiveAuthentication 默认 yes + UsePAM), 必须一起关。
+            set_ssh_config "PasswordAuthentication" "no"
+            set_ssh_config "KbdInteractiveAuthentication" "no"
+            if ! ssh_safe_apply; then
+                echo -e "${RED}SSH 配置应用失败, 已回滚到改动前状态。${NC}"
+                [ -n "$SSH_KEEP_FILE" ] && touch "$SSH_KEEP_FILE" 2>/dev/null
+                return 1
+            fi
+            # 再核对生效值: 三项必须同时达标, 否则回滚
+            local eff_pwd eff_kbd eff_pub
+            eff_pwd=$(ssh_effective_value PasswordAuthentication)
+            eff_kbd=$(ssh_effective_value KbdInteractiveAuthentication)
+            eff_pub=$(ssh_effective_value PubkeyAuthentication)
+            if [ "$eff_pwd" != "no" ] || [ "$eff_kbd" != "no" ] || [ "$eff_pub" != "yes" ]; then
+                echo -e "${RED}生效值核对失败 (PasswordAuthentication=${eff_pwd}, KbdInteractiveAuthentication=${eff_kbd}, PubkeyAuthentication=${eff_pub}), 正在回滚...${NC}"
+                [ -n "$SSH_KEEP_FILE" ] && touch "$SSH_KEEP_FILE" 2>/dev/null
+                ssh_restore
+                return 1
+            fi
+            pwd_disabled=true
+            echo -e "${GREEN}已禁用密码登录(密码验证与键盘交互均已关, 密钥登录仍开)。${NC}"
+        else
+            echo -e "${YELLOW}已保留密码登录(密钥登录已可用, 密码作为备用)。${NC}"
+        fi
     fi
 
     echo -e "\n${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${GREEN}        Root 密钥登录配置完成！       ${NC}"
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${YELLOW}下一步操作:${NC}"
-    echo -e "  1. 下载私钥文件到本地"
-    echo -e "  2. 设置私钥权限: ${GREEN}chmod 600 私钥文件${NC}"
-    echo -e "  3. 使用私钥登录: ${GREEN}ssh -i 私钥文件 root@服务器IP${NC}"
-    echo -e "${RED}  4. 确认密钥登录成功后，再断开当前会话！${NC}"
+    echo -e "${YELLOW}当前状态:${NC}"
+    echo -e "  密钥登录: ${GREEN}已开启并已实测可用${NC}"
+    if [ "$pwd_disabled" = true ]; then
+        echo -e "  密码登录: ${GREEN}已禁用${NC}"
+    else
+        echo -e "  密码登录: ${YELLOW}仍保留(备用)${NC}"
+    fi
+    echo -e "${YELLOW}提醒:${NC}"
+    echo -e "  · 如武装了安全回滚, 务必在新会话验证通过后执行上面打印的 touch 命令取消, 否则 300 秒后自动恢复到密码可用状态"
+    echo -e "  · 任何时候都不要在未验证新登录方式前断开当前会话"
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
 }
 
