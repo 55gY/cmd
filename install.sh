@@ -77,8 +77,17 @@ load_module() {
 load_common
 
 # ---------- 命令行参数 (非交互) ----------
-# 用法: install.sh ss config | ss auto | reality config | reality auto
-if [[ "$1" == "ss" && "$2" == "config" ]]; then
+# 用法: install.sh ss config | ss auto | reality config | reality auto | hy2 config | hy2 auto
+if [[ "$1" == "hy2" && "$2" == "config" ]]; then
+    detect_os
+    load_module hy2 && hy2_show_config false   # 不含二维码
+    exit $?
+elif [[ "$1" == "hy2" && "$2" == "auto" ]]; then
+    check_root
+    detect_os
+    load_module hy2 && hy2_install auto        # 随机全新节点, 非交互
+    exit $?
+elif [[ "$1" == "ss" && "$2" == "config" ]]; then
     detect_os
     load_module ss && view_ss_config false
     exit $?
@@ -111,6 +120,7 @@ while true; do
     echo "7. Mihomo 管理"
     echo "8. Reality (VLESS) 管理"
     echo "9. SOCKS5 (明文) 管理"
+    echo "10. Hysteria2 管理"
     echo "0. 退出"
     read -p "选择操作: " opt
     case $opt in
@@ -123,6 +133,7 @@ while true; do
         7) load_module mihomo && mihomo_menu ;;
         8) load_module reality && reality_menu ;;
         9) load_module socks5  && socks5_menu ;;
+        10) load_module hy2    && hy2_menu ;;
         0) exit 0 ;;
         *) echo "无效选项" ;;
     esac

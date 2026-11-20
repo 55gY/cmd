@@ -80,6 +80,11 @@ socks5_get_port() {
 REALITY_CONFIG="${REALITY_CONFIG:-/usr/local/etc/xray/config.json}"
 REALITY_BIN="${REALITY_BIN:-$(command -v xray 2>/dev/null || echo /usr/local/bin/xray)}"
 
+# Hysteria2 相关路径 (官方 get.hy2.sh 的安装位置: 二进制 /usr/local/bin/hysteria,
+# 配置 /etc/hysteria/config.yaml, 服务 hysteria-server)
+HY2_CONFIG="${HY2_CONFIG:-/etc/hysteria/config.yaml}"
+HY2_BIN="${HY2_BIN:-$(command -v hysteria 2>/dev/null || echo /usr/local/bin/hysteria)}"
+
 # --- 工具函数 ---
 # 版本号比较（大于等于）
 _version_ge() {
@@ -226,6 +231,23 @@ port_listen_str() {
     fi
 }
 
+# UDP 端口监听(带颜色): 监听中 / 未监听 / 未知
+# 与 port_listen_str 的区别: UDP 套接字没有 LISTEN 状态(ss -lun 显示 UNCONN),
+# 故只判该端口是否已被绑定; Hy2 为 UDP 协议, 不能复用 TCP 的 port_listen_str。
+port_listen_udp_str() {
+    local port="$1"
+    [[ -z "$port" ]] && { echo -e "${YELLOW}未知${NC}"; return; }
+    if command -v ss >/dev/null 2>&1; then
+        if ss -lun "sport = :${port}" 2>/dev/null | grep -q ":${port}[^0-9]"; then
+            echo -e "${GREEN_BOLD}监听中${NC}"
+        else
+            echo -e "${RED_BOLD}未监听${NC}"
+        fi
+    else
+        echo -e "${YELLOW}未知(缺 ss)${NC}"
+    fi
+}
+
 # 各代理端口解析 (集中, 主面板与详情面板共用)
 ss_get_port() { [[ -f "$CONFIG_PATH" ]] && grep -oP '"server_port"\s*:\s*\K[0-9]+' "$CONFIG_PATH" 2>/dev/null | head -1; }
 mihomo_get_port() { [[ -f "$CONFIG_FILE" ]] && grep -oP '^\s*mixed-port:\s*\K[0-9]+' "$CONFIG_FILE" 2>/dev/null | head -1; }
@@ -254,6 +276,12 @@ reality_get_port() {
     p=$(grep -oP '"port"\s*:\s*\K[0-9]+(?=\s*,?\s*//\s*\*\*\*)' "$REALITY_CONFIG" 2>/dev/null | head -1)
     [[ -z "$p" ]] && p=$(sed -E 's#//.*$##' "$REALITY_CONFIG" 2>/dev/null | grep -oP '"port"\s*:\s*\K[0-9]+' | head -1)
     echo "$p"
+}
+
+# Hysteria2 监听端口 (解析 config.yaml 首行的 listen: :<端口>)
+hy2_get_port() {
+    [[ -f "$HY2_CONFIG" ]] || return 0
+    grep -oP '^\s*listen:\s*:?\s*\K[0-9]+' "$HY2_CONFIG" 2>/dev/null | head -1
 }
 
 # SSH 单项配置的“真正生效值”(集中, 主面板与各模块共用):
@@ -584,6 +612,19 @@ check_status() {
         fi
     fi
 
+    # 检测 Hysteria2 安装状态
+    local hy2_status="未安装"
+    local hy2_color="${RED_BOLD}"
+    if [[ -f "$HY2_CONFIG" ]]; then
+        if systemctl is-active hysteria-server >/dev/null 2>&1; then
+            hy2_status="已安装 + 运行中"
+            hy2_color="${GREEN_BOLD}"
+        else
+            hy2_status="已安装 未运行"
+            hy2_color="${YELLOW}"
+        fi
+    fi
+
     # Root 登录（yes显示绿色，no显示红色）
     if [[ "$root_login" =~ ^(yes|YES)$ ]]; then
         echo -e "Root 登录           : ${GREEN_BOLD}$root_login${NC}"
@@ -601,15 +642,17 @@ check_status() {
     echo -e "SSH 端口            : ${GREEN_BOLD}$ports${NC}"
     echo -e "密钥文件状态        : ${auth_file_color}$auth_file_status${NC}"
     # 端口(仅在已安装时解析显示)
-    local ss_ps="" mihomo_ps="" reality_ps="" _p
+    local ss_ps="" mihomo_ps="" reality_ps="" hy2_ps="" _p
     if [[ "$ss_status" != "未安装" ]]; then _p=$(ss_get_port); [[ -n "$_p" ]] && ss_ps="  端口 ${_p}"; fi
     if [[ "$mihomo_status" != "未安装" ]]; then _p=$(mihomo_get_port); [[ -n "$_p" ]] && mihomo_ps="  端口 ${_p}"; fi
     if [[ "$reality_status" != "未安装" ]]; then _p=$(reality_get_port); [[ -n "$_p" ]] && reality_ps="  端口 ${_p}"; fi
+    if [[ "$hy2_status" != "未安装" ]]; then _p=$(hy2_get_port); [[ -n "$_p" ]] && hy2_ps="  端口 ${_p}"; fi
     local socks5_ps=""
     if [[ "$socks5_status" != "未安装" ]]; then _p=$(socks5_get_port); [[ -n "$_p" ]] && socks5_ps="  端口 ${_p}"; fi
     echo -e "SS 状态             : ${ss_color}$ss_status${NC}${CYAN}${ss_ps}${NC}"
     echo -e "Mihomo 状态         : ${mihomo_color}$mihomo_status${NC}${CYAN}${mihomo_ps}${NC}"
     echo -e "Reality 状态        : ${reality_color}$reality_status${NC}${CYAN}${reality_ps}${NC}"
+    echo -e "Hysteria2 状态      : ${hy2_color}$hy2_status${NC}${CYAN}${hy2_ps}${NC}"
     echo -e "SOCKS5 状态         : ${socks5_color}$socks5_status${NC}${CYAN}${socks5_ps}${NC}"
     
     # BBR 状态显示

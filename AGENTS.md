@@ -31,8 +31,8 @@ modules/*.sh      各功能实现,按需加载(.sh 后缀)
 
 - 一律用 `common.sh` 的 `panel_top "标题"` / `panel_bot` 包裹;行内状态用 `svc_status_str <服务>`、`port_listen_str <端口>`。
 - **配色语义**:🟢 绿=正常/运行中/更安全;🟡 黄=已安装未运行;🔴 红=未安装/未启用/不安全。
-- **主面板**:SS / Mihomo / Reality 在“已安装”时必须显示端口;端口解析集中在 `common.sh`(`ss_get_port` / `mihomo_get_port` / `reality_get_port`),口径一致。
-- **面板形式**:主菜单保持扁平结构。**SS / Mihomo / Reality / BBR 各有管理子菜单**(`*_menu`),在子菜单顶部显示自己的状态面板;**SSH / System 仍为直接动作**,在执行前先打印一次对应面板。
+- **主面板**:SS / Mihomo / Reality / Hysteria2 在“已安装”时必须显示端口;端口解析集中在 `common.sh`(`ss_get_port` / `mihomo_get_port` / `reality_get_port` / `hy2_get_port`),口径一致。Hysteria2 为 UDP,监听状态不得复用 TCP 的 `port_listen_str`,须用 `port_listen_udp_str`。
+- **面板形式**:主菜单保持扁平结构。**SS / Mihomo / Reality / Hysteria2 / BBR 各有管理子菜单**(`*_menu`),在子菜单顶部显示自己的状态面板;**SSH / System 仍为直接动作**,在执行前先打印一次对应面板。
 - 主菜单第 2 项为「BBR 网络优化管理」→ `bbr_menu`(内含 启用/应用优化、还原本脚本写入的配置)。还原入口只放在该子菜单内,不占主菜单项。
 
 ---
@@ -57,7 +57,7 @@ modules/*.sh      各功能实现,按需加载(.sh 后缀)
 - **需 root**;支持多发行版(apt / yum,`install_package_if_missing`)与多架构。
 - **去除**任何联系方式/群链接/教程视频链接/冗余说明。
 - 每个脚本以 `#!/bin/bash` 开头。
-- 命令行(非交互)参数:`install.sh ss config|ss auto|reality config|reality auto`。
+- 命令行(非交互)参数:`install.sh ss config|ss auto|reality config|reality auto|hy2 config|hy2 auto`。
 - 改动后务必:逐文件 `bash -n`;能同时 `source lib/common.sh` 与全部 `modules/*.sh` 而无报错、无函数重名。
 
 ## 5. SSH 安全(密钥登录 / 端口)—— 防锁死(关键)
@@ -135,3 +135,17 @@ modules/*.sh      各功能实现,按需加载(.sh 后缀)
 - `external:` 需要出口网卡名, 用 `ip route get` 推导; 取不到则报错中止, 不要写死 eth0。
 - 重置/卸载必须: 先取旧端口与旧账号 → `close_firewall <port> tcp udp` → `userdel` 删除认证账号 → 删除配置/凭据/日志/drop-in。卸载时另行询问是否 purge 软件包。
 - 明文 SOCKS5 不加密流量, 查看信息时须提示用户注意, 并提醒云服务器放行安全组。
+
+## 8. Hysteria2 模块约束 (Phase 1: 自签证书, 2026-11-20 新增)
+
+- **基准**:crazypeace/hy2 的极简核心(官方 `get.hy2.sh` + 自签 + 28 行配置)按本项目规范重写;seagullz4/hysteria2 只当二期功能清单,不当基准(见评估: 单体菜单 + Python 双实现 + `/root/hy3` 非标准路径 + 写死 eth0 的端口跳跃 + XanMod 换内核, 均与 §1/§4/§6 冲突)。
+- **安装位置(官方脚本决定, 不许自造)**:二进制 `/usr/local/bin/hysteria`、配置 `/etc/hysteria/config.yaml`、服务 `hysteria-server`。不做版本锁定(官方脚本已是最新版时跳过安装);与 Reality 的 `XRAY_VERSION` 锁定不同。
+- **默认随机、每次全新节点**:密码 = `cat /proc/sys/kernel/random/uuid`(本地随机, 不许调外部 UUID API、不许由 IP/主机名派生, 与 Reality 的 UUID 同规则);端口默认 **2096**(**UDP**, 与 Reality 的 443/TCP 不同, 别抢 443);自签证书域名默认 `learn.microsoft.com`。
+- **自签证书**:EC `prime256v1`、`openssl req -x509`、36500 天。服务以官方安装器创建的 `hysteria` 系统用户运行(非 root), 私钥权限为 **640 + 属组 hysteria**、证书 644、目录 755;取不到服务用户时回退 644 并告警。**绝不许用 crazypeace 的 `chmod 777`**。
+- **防火墙**:`open_firewall <端口> udp` / 卸载 `close_firewall <端口> udp`;Hy2 是 UDP, 与 Reality 的 TCP 不同。
+- **监听检测**:UDP 套接字无 LISTEN 状态, 详情面板用 `port_listen_udp_str`(common.sh, `ss -lun` 判绑定), 不得用 TCP 的 `port_listen_str`。
+- **分享链接**:`hysteria2://<密码>@<IP>:<端口>?alpn=h3&insecure=1&pinSHA256=<指纹>#HY2_<IP>`;指纹 = 证书 DER 的 SHA-256。密码须只含字母/数字/`._~-`, 否则链接会断, 交互输入时校验。
+- **配置与 crazypeace 的一处偏差**:它的 `acl.inline` 只有一行被注释掉的规则, 解析后为 null;这里写成显式的 `direct(all)`, 出站保留 `direct` + `socks5(127.0.0.1:1080)` 备选。
+- **运行前检测**:已安装且配置有效时先输出有配置 + 分享链接(**不含二维码**), 再用 `confirm` 问是否重装(回车=是, `n` 保留退出);非交互(auto)自动继续。
+- **卸载(§6)**:先取端口与证书域名 → 停/禁服务 → 官方脚本 `--remove`(只删二进制与服务单元, **不删配置与 hysteria 用户**, 须手动补) → 删 `/etc/hysteria`、本次的两个证书文件(只删这两个, `/etc/ssl/private` 为共享目录不许整目录删)、`~/_hy2_url_`、服务单元与 `multi-user.target.wants` 软链 → `userdel -r hysteria`(仅当家目录为 `/var/lib/hysteria` 的系统用户) → `close_firewall <端口> udp` → `daemon-reload` / `reset-failed`。`--remove` 不能用 `bash -c "$(curl ...)" --remove`(会被当成 `$0`), 须先下载到临时文件再带参数执行。
+- **Phase 1 不做**:ACME 真域名证书、伪装站 `masquerade`、obfs、sniff、端口跳跃。做二期时 ACME 优先, 端口跳跃最后(须先抽象成 common 的防火墙能力, 不许写死 eth0、不许另起 `ipppp.service` 这类私货)。
