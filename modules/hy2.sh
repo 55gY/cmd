@@ -251,6 +251,27 @@ hy2_show_config() {
             echo -e "${YELLOW}未安装 qrencode, 跳过二维码。${NC}"
         fi
     fi
+    # --- Quantumult X 原生行 (QX 1.9.0 build 965+ 才支持 Hy2, 正式版 1.8.1 不行) ---
+    # 自签默认链接是 insecure=1 + pinSHA256 (仅凭指纹验证), QX 原生格式没有这种模式,
+    # KOP-XIAO 资源解析器会拒掉 ("无法等价保留仅凭指纹验证的设置"); 直接给原生行绕开解析器。
+    # QX 里 pin 只是正常验证之外的附加校验, tls-verification=false 时 pin 直接被忽略,
+    # 所以自签行用 tls-verification=true + tls-cert-sha256, 仍须真机验证能否连上。
+    local qx_line="hysteria2=${host}:${_hy2_port}, password=${_hy2_password}, tls-host=${_hy2_domain}, tls-verification=true"
+    if [[ "$_hy2_cert_type" != "acme" ]]; then
+        qx_line="${qx_line}, tls-cert-sha256=${_hy2_pin}"
+    fi
+    [[ -n "$_hy2_obfs_pw" ]] && qx_line="${qx_line}, salamander-password=${_hy2_obfs_pw}"
+    [[ -n "$_hy2_hop" ]] && qx_line="${qx_line}, port-hopping=${_hy2_hop}"
+    qx_line="${qx_line}, udp-relay=true, tag=HY2_${frag}"
+    echo
+    echo -e "$green Quantumult X 原生行 (粘贴到 [server_local]): $none"
+    echo -e "${cyan}${qx_line}${none}"
+    echo -e "${YELLOW}QX 需 1.9.0 build 965+ (TestFlight beta), 正式版 1.8.1 不支持 Hy2。${NC}"
+    if [[ "$_hy2_cert_type" == "acme" ]]; then
+        echo -e "${YELLOW}ACME 真证书: 此行可直接用。${NC}"
+    else
+        echo -e "${YELLOW}自签证书: 此行需真机验证; 若连不上, 请切 ACME 或改用 Clash/小火箭。${NC}"
+    fi
 }
 
 # 依赖
