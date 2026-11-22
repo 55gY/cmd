@@ -194,6 +194,7 @@ hy2_show_config() {
     echo -e "${BLUE}---------- Hysteria2 节点配置 ----------${NC}"
     if [[ "$_hy2_cert_type" == "acme" ]]; then
         echo -e "$yellow 域名 (Domain) = ${cyan}${_hy2_domain}$none"
+        echo -e "$yellow 地址 (Address) = ${cyan}${ip:-获取失败, 链接用域名}$none"
         echo -e "$yellow 证书 (TLS) = ${cyan}ACME 真证书 (${_hy2_acme_type})${none}"
     else
         echo -e "$yellow 地址 (Address) = ${cyan}${ip:-获取失败}$none"
@@ -215,7 +216,7 @@ hy2_show_config() {
     [[ -n "$_hy2_obfs_pw" ]] && echo -e "$yellow 混淆 (Obfs) = ${cyan}salamander${none}"
     [[ "$_hy2_sniff" == "1" ]] && echo -e "$yellow 协议嗅探 (Sniff) = ${cyan}已启用${none}"
     if [[ "$_hy2_cert_type" == "acme" ]]; then
-        echo -e "${YELLOW}ACME 真证书: 客户端不用开 allowInsecure, 用域名 + SNI 连接; 云服务器另需在安全组放行 UDP ${_hy2_port}。${NC}"
+        echo -e "${YELLOW}ACME 真证书: 客户端不用开 allowInsecure, 连接地址用 IP、SNI 用域名验签; 云服务器另需在安全组放行 UDP ${_hy2_port}。${NC}"
     else
         echo -e "${YELLOW}自签证书: 客户端须开 allowInsecure 或校验 pinSHA256; 云服务器另需在安全组放行 UDP ${_hy2_port}。${NC}"
     fi
@@ -229,8 +230,13 @@ hy2_show_config() {
         echo -e "${RED}未获取到公网 IP, 无法生成分享链接。${NC}"
         return 1
     fi
+    # ACME 输出默认用 IP 作连接地址 (绕开手机端域名解析抽风); SNI/tls-host 仍用域名验签。
+    # IP 拿不到时回退域名。tag 仍用域名, 便于认节点。
     local host="$disp_ip" frag="$ip"
-    if [[ "$_hy2_cert_type" == "acme" ]]; then host="$_hy2_domain"; frag="$_hy2_domain"; fi
+    if [[ "$_hy2_cert_type" == "acme" ]]; then
+        frag="$_hy2_domain"
+        [[ -z "$host" ]] && host="$_hy2_domain"
+    fi
     local query="alpn=h3"
     if [[ "$_hy2_cert_type" == "acme" ]]; then
         query="${query}&sni=${_hy2_domain}"
@@ -255,7 +261,8 @@ hy2_show_config() {
     # 自签默认链接是 insecure=1 + pinSHA256 (仅凭指纹验证), QX 原生格式没有这种模式,
     # KOP-XIAO 资源解析器会拒掉 ("无法等价保留仅凭指纹验证的设置"); 直接给原生行绕开解析器。
     # QX 里 pin 只是正常验证之外的附加校验, tls-verification=false 时 pin 直接被忽略,
-    # 所以自签行用 tls-verification=true + tls-cert-sha256, 仍须真机验证能否连上。
+    # 所以自签行用 tls-verification=true + tls-cert-sha256, 已由用户真机验证可连 (2026-11-22)。
+    # ACME 行的连接地址默认用 IP (绕开手机端域名解析抽风), tls-host=域名已在行内, 验签不受影响。
     local qx_line="hysteria2=${host}:${_hy2_port}, password=${_hy2_password}, tls-host=${_hy2_domain}, tls-verification=true"
     if [[ "$_hy2_cert_type" != "acme" ]]; then
         qx_line="${qx_line}, tls-cert-sha256=${_hy2_pin}"
@@ -270,7 +277,7 @@ hy2_show_config() {
     if [[ "$_hy2_cert_type" == "acme" ]]; then
         echo -e "${YELLOW}ACME 真证书: 此行可直接用。${NC}"
     else
-        echo -e "${YELLOW}自签证书: 此行需真机验证; 若连不上, 请切 ACME 或改用 Clash/小火箭。${NC}"
+        echo -e "${YELLOW}自签证书: 此行已真机验证可连 (2026-11-22)。${NC}"
     fi
 }
 
@@ -427,6 +434,19 @@ _hy2_valid_port() {
     esac
 }
 
+# 端口是否被 Hy2 自身之外的程序占用 (返回 0 = 被占用, 1 = 空闲或只有自家服务在听)
+# 重装时旧服务仍在运行、最后才 restart, 占用检查必须排除它, 否则默认端口 2096 永远误报占用。
+# 先停服务再检查是错的: 用户中途退出会把节点留在停止状态。
+_hy2_port_in_use_by_other() {
+    local port="$1" listeners
+    command -v ss >/dev/null 2>&1 || return 1
+    listeners=$(ss -lunp "sport = :${port}" 2>/dev/null | grep ":${port}[^0-9]" || true)
+    [[ -z "$listeners" ]] && return 1
+    # 监听行里只要有一行不是 hysteria 进程, 就是真占用
+    echo "$listeners" | grep -qv '"hysteria"' && return 0
+    return 1
+}
+
 # 完整安装 / 重装. 参数1: auto = 非交互(随机全新节点, 默认端口 2096/域名 learn.microsoft.com)
 # 重装固定为自签证书 + 无附加功能 (与 Phase 1 同行为); ACME/伪装/混淆/嗅探/跳跃用菜单开关另行开启。
 hy2_install() {
@@ -491,7 +511,7 @@ hy2_install() {
             read -p "$(echo -e "请输入端口 [${magenta}1-65535${none}] (默认 ${cyan}${HY2_DEFAULT_PORT}${none}): ")" port
             [ -z "$port" ] && port="$HY2_DEFAULT_PORT"
             if _hy2_valid_port "$port"; then
-                if command -v ss >/dev/null 2>&1 && ss -lun "sport = :${port}" 2>/dev/null | grep -q ":${port}"; then
+                if _hy2_port_in_use_by_other "$port"; then
                     echo -e "${RED}UDP 端口 ${port} 已被占用, 请换一个。${NC}"
                     port=""; continue
                 fi
