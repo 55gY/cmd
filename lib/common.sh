@@ -284,6 +284,18 @@ hy2_get_port() {
     grep -oP '^\s*listen:\s*:?\s*\K[0-9]+' "$HY2_CONFIG" 2>/dev/null | head -1
 }
 
+# Hysteria2 端口跳跃段 (listen: :<首>-<尾> 时输出 "首-尾", 否则空)
+hy2_get_hop_range() {
+    [[ -f "$HY2_CONFIG" ]] || return 0
+    grep -oP '^\s*listen:\s*:\K[0-9]+-[0-9]+' "$HY2_CONFIG" 2>/dev/null | head -1
+}
+
+# Hysteria2 证书类型: acme(内置 ACME) / selfsigned(自签 tls 块)
+hy2_get_cert_type() {
+    [[ -f "$HY2_CONFIG" ]] || return 0
+    if grep -q '^acme:' "$HY2_CONFIG" 2>/dev/null; then echo acme; else echo selfsigned; fi
+}
+
 # SSH 单项配置的“真正生效值”(集中, 主面板与各模块共用):
 # sshd 是“第一个未注释值生效”, 且 Include 的 drop-in 先读先赢, 只 grep 主文件会看错
 # (旧面板就因此谎报过 PasswordAuthentication)。优先用 `sshd -T`(解析 Include/Match),
@@ -418,6 +430,93 @@ close_firewall() {
         fi
     fi
     [ -n "$closed" ] && echo -e "${GREEN}  ✓ 已回收防火墙放行: ${port} (${protos[*]}) [${closed}]${NC}"
+    return 0
+}
+
+# ---------- 通用: 防火墙规则持久化 (open/close_firewall* 共用) ----------
+_firewall_save() {
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save >/dev/null 2>&1
+    elif [ -d /etc/iptables ] && command -v iptables-save >/dev/null 2>&1; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        command -v ip6tables-save >/dev/null 2>&1 && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
+    elif command -v service >/dev/null 2>&1; then
+        service iptables save >/dev/null 2>&1
+    fi
+}
+
+# ---------- 通用: 放行本机防火墙端口段 (端口跳跃等需要整段放行时用) ----------
+# 用法: open_firewall_range <首端口> <尾端口> [协议...]   协议默认 tcp
+# 与 open_firewall 的区别只是端口写法: ufw 用 "首:尾/协议"、firewalld 用 "首-尾/协议"、
+# iptables 用 --dport "首:尾"。仅 nftables 时提示手动 (与 open_firewall 同口径)。
+open_firewall_range() {
+    local first="$1" last="$2"; shift 2
+    local protos=("$@"); [ ${#protos[@]} -eq 0 ] && protos=("tcp")
+    local opened="" proto did=""
+    if command -v ufw >/dev/null 2>&1; then
+        for proto in "${protos[@]}"; do ufw allow "${first}:${last}/${proto}" >/dev/null 2>&1; done
+        opened="ufw (v4+v6)"
+    elif command -v firewall-cmd >/dev/null 2>&1; then
+        for proto in "${protos[@]}"; do firewall-cmd --permanent --add-port="${first}-${last}/${proto}" >/dev/null 2>&1; done
+        firewall-cmd --reload >/dev/null 2>&1
+        opened="firewalld (v4+v6)"
+    else
+        for proto in "${protos[@]}"; do
+            if command -v iptables >/dev/null 2>&1; then
+                iptables -C INPUT -p "$proto" --dport "${first}:${last}" -j ACCEPT 2>/dev/null \
+                    || iptables -I INPUT -p "$proto" --dport "${first}:${last}" -j ACCEPT 2>/dev/null
+                did="iptables"
+            fi
+            if command -v ip6tables >/dev/null 2>&1; then
+                ip6tables -C INPUT -p "$proto" --dport "${first}:${last}" -j ACCEPT 2>/dev/null \
+                    || ip6tables -I INPUT -p "$proto" --dport "${first}:${last}" -j ACCEPT 2>/dev/null
+                did="iptables+ip6tables"
+            fi
+        done
+        if [ -n "$did" ]; then _firewall_save; opened="$did"; fi
+    fi
+
+    if [ -n "$opened" ]; then
+        echo -e "${GREEN}  ✓ 已放行本机防火墙: ${first}-${last} (${protos[*]}) [${opened}]${NC}"
+    elif command -v nft >/dev/null 2>&1; then
+        echo -e "${YELLOW}  · 检测到 nftables 但无 ufw/firewalld: 未自动放行, 请手动放行 ${first}-${last} (${protos[*]})${NC}"
+    else
+        echo -e "${YELLOW}  · 未检测到受支持的防火墙工具; 若有防火墙/云安全组请手动放行 ${first}-${last} (${protos[*]})${NC}"
+    fi
+}
+
+# ---------- 通用: 回收本机防火墙端口段 (open_firewall_range 的逆操作) ----------
+# 用法: close_firewall_range <首端口> <尾端口> [协议...]   协议默认 tcp
+close_firewall_range() {
+    local first="$1" last="$2"; shift 2
+    local protos=("$@"); [ ${#protos[@]} -eq 0 ] && protos=("tcp")
+    [ -z "$first" ] || [ -z "$last" ] && return 0
+    local closed="" proto did=""
+    if command -v ufw >/dev/null 2>&1; then
+        for proto in "${protos[@]}"; do ufw delete allow "${first}:${last}/${proto}" >/dev/null 2>&1; done
+        closed="ufw"
+    elif command -v firewall-cmd >/dev/null 2>&1; then
+        for proto in "${protos[@]}"; do firewall-cmd --permanent --remove-port="${first}-${last}/${proto}" >/dev/null 2>&1; done
+        firewall-cmd --reload >/dev/null 2>&1
+        closed="firewalld"
+    else
+        for proto in "${protos[@]}"; do
+            if command -v iptables >/dev/null 2>&1; then
+                while iptables -C INPUT -p "$proto" --dport "${first}:${last}" -j ACCEPT 2>/dev/null; do
+                    iptables -D INPUT -p "$proto" --dport "${first}:${last}" -j ACCEPT 2>/dev/null || break
+                done
+                did="iptables"
+            fi
+            if command -v ip6tables >/dev/null 2>&1; then
+                while ip6tables -C INPUT -p "$proto" --dport "${first}:${last}" -j ACCEPT 2>/dev/null; do
+                    ip6tables -D INPUT -p "$proto" --dport "${first}:${last}" -j ACCEPT 2>/dev/null || break
+                done
+                did="iptables+ip6tables"
+            fi
+        done
+        if [ -n "$did" ]; then _firewall_save; closed="$did"; fi
+    fi
+    [ -n "$closed" ] && echo -e "${GREEN}  ✓ 已回收防火墙放行: ${first}-${last} (${protos[*]}) [${closed}]${NC}"
     return 0
 }
 
@@ -646,7 +745,7 @@ check_status() {
     if [[ "$ss_status" != "未安装" ]]; then _p=$(ss_get_port); [[ -n "$_p" ]] && ss_ps="  端口 ${_p}"; fi
     if [[ "$mihomo_status" != "未安装" ]]; then _p=$(mihomo_get_port); [[ -n "$_p" ]] && mihomo_ps="  端口 ${_p}"; fi
     if [[ "$reality_status" != "未安装" ]]; then _p=$(reality_get_port); [[ -n "$_p" ]] && reality_ps="  端口 ${_p}"; fi
-    if [[ "$hy2_status" != "未安装" ]]; then _p=$(hy2_get_port); [[ -n "$_p" ]] && hy2_ps="  端口 ${_p}"; fi
+    if [[ "$hy2_status" != "未安装" ]]; then _p=$(hy2_get_hop_range); if [[ -n "$_p" ]]; then hy2_ps="  跳跃 ${_p}"; else _p=$(hy2_get_port); [[ -n "$_p" ]] && hy2_ps="  端口 ${_p}"; fi; [[ "$(hy2_get_cert_type)" == "acme" ]] && hy2_ps="${hy2_ps}  ACME"; fi
     local socks5_ps=""
     if [[ "$socks5_status" != "未安装" ]]; then _p=$(socks5_get_port); [[ -n "$_p" ]] && socks5_ps="  端口 ${_p}"; fi
     echo -e "SS 状态             : ${ss_color}$ss_status${NC}${CYAN}${ss_ps}${NC}"

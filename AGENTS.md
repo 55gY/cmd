@@ -148,4 +148,14 @@ modules/*.sh      各功能实现,按需加载(.sh 后缀)
 - **配置与 crazypeace 的一处偏差**:它的 `acl.inline` 只有一行被注释掉的规则, 解析后为 null;这里写成显式的 `direct(all)`, 出站保留 `direct` + `socks5(127.0.0.1:1080)` 备选。
 - **运行前检测**:已安装且配置有效时先输出有配置 + 分享链接(**不含二维码**), 再用 `confirm` 问是否重装(回车=是, `n` 保留退出);非交互(auto)自动继续。
 - **卸载(§6)**:先取端口与证书域名 → 停/禁服务 → 官方脚本 `--remove`(只删二进制与服务单元, **不删配置与 hysteria 用户**, 须手动补) → 删 `/etc/hysteria`、本次的两个证书文件(只删这两个, `/etc/ssl/private` 为共享目录不许整目录删)、`~/_hy2_url_`、服务单元与 `multi-user.target.wants` 软链 → `userdel -r hysteria`(仅当家目录为 `/var/lib/hysteria` 的系统用户) → `close_firewall <端口> udp` → `daemon-reload` / `reset-failed`。`--remove` 不能用 `bash -c "$(curl ...)" --remove`(会被当成 `$0`), 须先下载到临时文件再带参数执行。
-- **Phase 1 不做**:ACME 真域名证书、伪装站 `masquerade`、obfs、sniff、端口跳跃。做二期时 ACME 优先, 端口跳跃最后(须先抽象成 common 的防火墙能力, 不许写死 eth0、不许另起 `ipppp.service` 这类私货)。
+- **Phase 2: ACME 真域名证书 + 伪装站 (2026-11-20 已落地)**:
+  - ACME 用 Hysteria2 **内置 `acme:`**(不用 acme.sh):`domains` + `email` + `type`。`type` 默认 `http`(走 TCP 80 校验;本机 Reality 占 TCP 443,ACME 绝不能走 443 才能共存);DNS-01 可选 Cloudflare / DuckDNS(token 写进配置,提示用最小权限 token)。证书由 Hysteria 自己申请/续期,存 `/var/lib/hysteria/acme`(随 `userdel -r hysteria` 清理)。
+  - 切换 ACME 前置检查:域名须解析到本机公网 IP(不符只警告)、`type: http` 时 TCP 80 须空闲(被占则提示改 DNS-01);放行本机防火墙 TCP 80,安全组另行提示。改前备份 `config.yaml`,起服失败则恢复备份 + 重启 + 报错,不许把坏配置留在原地。
+  - 分享链接:ACME 模式用域名 + `sni=<域名>`,去掉 `insecure`/`pinSHA256`;自签模式保持 IP + `insecure=1` + `pinSHA256`。
+  - 伪装站:`masquerade: type: proxy, proxy: url + rewriteHost: true`,默认 `https://news.ycombinator.com/`(seagullz4 默认),可改。**不加 `listenHTTP`/`listenHTTPS`**:`listenHTTP: :80` 会抢 ACME HTTP-01 的 80 端口,`listenHTTPS: :443` 会撞 Reality 的 TCP 443。
+- **Phase 3: obfs + sniff + 端口跳跃 (2026-11-20 已落地)**:
+  - obfs:`type: salamander` + 密码(本地随机 UUID 或用户输入,字符集同主密码);链接加 `&obfs=salamander&obfs-password=<密码>`。**obfs 与伪装站互斥**:开 obfs 自动去掉伪装块并明示;开伪装时 obfs 在开则拒绝,先关 obfs。
+  - sniff:照 seagullz4 默认块(`enable: true, timeout: 2s, rewriteDomain: false, tcpPorts: 80,443,8000-9000, udpPorts: all`),开关即整块有无。
+  - 端口跳跃:用 Hysteria2 **≥2.8.0 原生 `listen: :FIRST-LAST`** (服务端自己绑段首端口并重定向其余端口,停服自动清理;**不写 iptables、不建 `ipppp.service`、不写死 eth0/网口**)。核心版本 <2.8.0 时拒绝并提示重装核心(官方脚本装最新版,当前 2.13+)。防火墙段走 common 新增的 `open_firewall_range` / `close_firewall_range`(ufw `first:last/udp`、firewalld `first-last/udp`、iptables `--dport first:last`);链接地址端口取段首 + `&mport=FIRST-LAST`。开关跳跃时同步开关防火墙(开:关单端口、开段;关:关段、开单端口)。
+- **配置单写者**:`_hy2_write_config` 是唯一写配置入口(按 `_hy2_*` 状态变量渲染整份 YAML);`_hy2_parse_config` 用分段感知 awk 回读全部块(证书类型/域名/邮箱/ACME 类型/DNS token/伪装 URL/obfs 密码/sniff/跳跃段),不许用 sed 补丁式改配置。任何改配置的操作走 `_hy2_apply_config`(备份→写→重启→验活,失败恢复备份 + 重启)。
+- **卸载(§6)补**:先解析配置 → 有跳跃段则 `close_firewall_range`、ACME `type: http` 则 `close_firewall 80 tcp`、再关单端口 → 删 `config.yaml.bak` 与其余 Phase 1 清单。

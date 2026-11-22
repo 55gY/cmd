@@ -27,7 +27,7 @@ modules/            # 功能模块,按需下载(仅在菜单中选中该功能�
   mihomo.sh         # Mihomo
   reality.sh        # VLESS + Reality (Xray)
   socks5.sh         # SOCKS5 (明文, Dante)
-  hy2.sh            # Hysteria2 (自签证书, UDP)
+  hy2.sh            # Hysteria2 (自签/ACME 证书, UDP; 伪装/obfs/sniff/端口跳跃)
 ```
 
 - **状态检测集中在 `lib/common.sh`**,随 `install.sh` 一起加载,因此一进入主菜单即可显示**全部**功能状态,无需下载任何模块。
@@ -62,7 +62,7 @@ modules/            # 功能模块,按需下载(仅在菜单中选中该功能�
 5. **系统配置** — 时区 Asia/Shanghai、中文字体(WQY)+Locale。
 6. **Reality (VLESS) 管理** — 一键安装/重装 Xray VLESS+Reality;**UUID/x25519 密钥/ShortID 默认随机**;运行前分项检测面板(程序/配置/服务/端口监听);查看配置 + 分享链接 + 二维码;卸载。
 7. **SOCKS5 (明文) 管理** — 基于 Dante 一键安装/重置;**账号、密码、端口全随机**;标准 SOCKS5 用户名密码认证(不加密);查看连接信息;卸载(清理配置/账号/日志/防火墙放行)。
-8. **Hysteria2 管理** — 一键安装/重装 Hysteria2(官方 `get.hy2.sh` 装最新版);**密码默认随机 UUID、端口默认 2096/UDP**;自签证书(域名默认 `learn.microsoft.com`);运行前分项检测面板(程序/配置/服务/UDP 端口监听);查看配置 + 分享链接(`hysteria2://`, 含 `pinSHA256`) + 二维码;卸载。
+8. **Hysteria2 管理** — 一键安装/重装 Hysteria2(官方 `get.hy2.sh` 装最新版);**密码默认随机 UUID、端口默认 2096/UDP**;自签证书(域名默认 `learn.microsoft.com`);运行前分项检测面板(程序/配置/服务/UDP 端口监听);查看配置 + 分享链接(`hysteria2://`, 自签含 `pinSHA256`、ACME 含 `sni`) + 二维码;卸载。Phase 2:内置 ACME 真域名证书(HTTP-01 走 TCP 80 / DNS-01 Cloudflare/DuckDNS, 失败自动恢复原配置) + 伪装站(反代默认 `https://news.ycombinator.com/`)。Phase 3:Salamander 混淆(与伪装互斥)、协议嗅探 Sniff、端口跳跃(原生 `listen: :首-尾`, 需核心 ≥2.8.0)。
 9. **系统状态面板** — 实时显示 OS/架构/时区/Locale/SSH/SS/Mihomo/**Reality**/**Hysteria2**/**SOCKS5**/BBR 等状态。
 
 ## 系统要求
